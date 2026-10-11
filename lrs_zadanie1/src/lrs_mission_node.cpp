@@ -517,6 +517,91 @@ private:
     cloud_pub_->publish(cloud);
   }
 
+  // ============================================================ A1.3 outdoor
+
+  void setupOutdoor()
+  {
+    alt_ = declare_parameter("altitude", 5.0);
+    side_ = declare_parameter("square_side", 5.0);
+    amp_ = declare_parameter("figure8_amplitude", 3.0);
+    omega_ = declare_parameter("figure8_omega", 0.3);
+    laps_ = declare_parameter("figure8_laps", 1.0);
+    poi_offset_ = {declare_parameter("poi_east", 0.0), declare_parameter("poi_north", 5.0), 0.0};
+    poi_lat_ = declare_parameter("poi_lat", 0.0);  // used instead of the offset when non-zero
+    poi_lon_ = declare_parameter("poi_lon", 0.0);
+    min_sats_ = declare_parameter("min_satellites", 6);
+
+    auto qos = rclcpp::SensorDataQoS();
+    fix_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+      "/mavros/global_position/global", qos, [this](sensor_msgs::msg::NavSatFix::ConstSharedPtr m) {fix_ = *m;});
+    sats_sub_ = create_subscription<std_msgs::msg::UInt32>(
+      "/mavros/global_position/raw/satellites", qos, [this](std_msgs::msg::UInt32::ConstSharedPtr m) {sats_ = m->data;});
+    hdg_sub_ = create_subscription<std_msgs::msg::Float64>(
+      "/mavros/global_position/compass_hdg", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {hdg_ = m->data;});
+    relalt_sub_ = create_subscription<std_msgs::msg::Float64>(
+      "/mavros/global_position/rel_alt", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {rel_alt_ = m->data;});
+    home_sub_ = create_subscription<mavros_msgs::msg::HomePosition>(  // latched topic
+      "/mavros/home_position/home", rclcpp::QoS(1).transient_local(), [this](mavros_msgs::msg::HomePosition::ConstSharedPtr m) {
+        if (!home_) {
+          home_ = true;
+          geo_.lat0 = m->geo.latitude;
+          geo_.lon0 = m->geo.longitude;
+          home_local_ = {m->position.x, m->position.y, m->position.z};
+          RCLCPP_INFO(get_logger(), "home: lat %.7f lon %.7f alt %.2f, local (%.2f %.2f %.2f)",
+            geo_.lat0, geo_.lon0, m->geo.altitude, home_local_.x, home_local_.y, home_local_.z);
+        }
+      });
+    status_timer_ = create_wall_timer(1s, [this] {printStatus();});
+  }
+
+  bool gpsReady() const
+  {
+    return home_ && fix_.status.status >= sensor_msgs::msg::NavSatStatus::STATUS_FIX &&
+           sats_ >= static_cast<unsigned>(min_sats_);
+  }
+
+  // Called once home is known: everything is defined relative to it.
+  void buildOutdoorActions()
+  {
+    // POI and corners are defined geodetically, then converted to local metres.
+    double plat = poi_lat_, plon = poi_lon_;
+    if (plat == 0.0 && plon == 0.0) {geo_.toGeo(poi_offset_, plat, plon);}
+    const V3 h{side_ / 2, side_ / 2, 0};
+    const std::vector<V3> corner_offsets = {{-h.x, h.y, 0}, {h.x, h.y, 0}, {h.x, -h.y, 0}, {-h.x, -h.y, 0}};
+    const V3 up{0, 0, alt_};
+    poi_ = home_local_ + geo_.toEnu(plat, plon);  // POI on the ground
+    RCLCPP_INFO(get_logger(), "POI lat %.7f lon %.7f -> local (%.2f %.2f)", plat, plon, poi_.x, poi_.y);
+
+    actions_.push_back({Type::TAKEOFF, home_local_ + up, 0, Tol::HARD, false, "takeoff to 5 m"});
+    for (size_t i = 0; i < corner_offsets.size(); ++i) {
+      double lat, lon;
+      geo_.toGeo(geo_.toEnu(plat, plon) + corner_offsets[i], lat, lon);
+      const V3 local = home_local_ + geo_.toEnu(lat, lon) + up;
+      RCLCPP_INFO(get_logger(), "corner W%zu lat %.7f lon %.7f -> local (%.2f %.2f %.2f)", i + 1, lat, lon,
+        local.x, local.y, local.z);
+      actions_.push_back({Type::GOTO, local, 0, Tol::SOFT, true, "corner W" + std::to_string(i + 1)});
+    }
+    actions_.push_back({Type::GOTO, poi_ + up, 0, Tol::HARD, false, "figure-8 centre"});
+    actions_.push_back({Type::YAW, poi_ + up, M_PI / 4, Tol::HARD, false, "align with tangent at t=0"});
+    actions_.push_back({Type::FIGURE8, poi_ + up, 0, Tol::PASS, false, "figure-8"});
+    actions_.push_back({Type::GOTO, home_local_ + up, 0, Tol::HARD, false, "return to launch"});
+    actions_.push_back({Type::LAND, home_local_, 0, Tol::HARD, false, "land"});
+  }
+
+  void printStatus()
+  {
+    if (!home_ || !have_pose_) {return;}
+    const V3 gps = geo_.toEnu(fix_.latitude, fix_.longitude);
+    const V3 loc = pos_ - home_local_;
+    double lat, lon;
+    geo_.toGeo(loc, lat, lon);
+    RCLCPP_INFO(get_logger(),
+      "GPS lat %.7f lon %.7f amsl %.2f -> ENU (%.2f %.2f) | local ENU from home (%.2f %.2f %.2f) -> lat %.7f lon %.7f"
+      " | rel_alt %.2f | compass %.1f deg (N, CW) -> ENU yaw %.1f deg, pose yaw %.1f deg (E, CCW) | sats %u",
+      fix_.latitude, fix_.longitude, fix_.altitude, gps.x, gps.y, loc.x, loc.y, loc.z, lat, lon, rel_alt_, hdg_,
+      deg(wrap(rad(90.0 - hdg_))), deg(yaw_), sats_);
+  }
+
   // ============================================================ state machine
 
   void tick()

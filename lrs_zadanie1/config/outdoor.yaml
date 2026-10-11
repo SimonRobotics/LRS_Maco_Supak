@@ -1,0 +1,26 @@
+lrs_mission:
+  ros__parameters:
+    mission: outdoor
+    rate_hz: 20.0
+    min_satellites: 6
+
+    altitude: 5.0            # [m] above home (local z - home z)
+    square_side: 5.0         # [m]
+    figure8_amplitude: 3.0   # [m]
+    # max speed A*w*sqrt(2) = 3 * 0.3 * 1.41 = 1.27 m/s (< 1.5 m/s), lap 2*pi/0.3 = 21 s
+    figure8_omega: 0.3       # [rad/s]
+    figure8_laps: 1.0
+
+    # POI on the ground, as an offset from home [m] (east, north) ...
+    poi_east: 0.0
+    poi_north: 5.0
+    # ... or absolute lat/lon (used when non-zero)
+    poi_lat: 0.0
+    poi_lon: 0.0
+
+    hard_tolerance: 0.15
+    hard_max_speed: 0.15
+    hard_settle_time: 1.0
+    soft_tolerance: 0.40
+    yaw_tolerance_deg: 5.0
+    max_speed: 1.5           # [m/s] speed of the moving setpoint along each segment
