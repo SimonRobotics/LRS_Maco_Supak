@@ -1,0 +1,30 @@
+lrs_mission:
+  ros__parameters:
+    mission: indoor
+
+    # --- A1.1 map
+    resolution: 0.1          # voxel edge [m]
+    # 0.25 drone half-diagonal (0.347 x 0.347 m) + 0.15 hard tolerance + 0.10 margin
+    inflation_radius: 0.5
+    # Racks are solid in Gazebo but the point cloud has gaps between shelf levels:
+    # fill each rack row as a box = bounding box of its collision elements in
+    # models/fei_lrs_racks/model.sdf. 6 numbers per box: xmin ymin zmin xmax ymax zmax (map frame)
+    rack_boxes: [1.07,  6.29, 0.0, 7.57,  7.35, 4.10,
+                 1.07, 10.83, 0.0, 7.57, 11.89, 4.10]
+
+    # --- map -> MAVROS local ENU
+    # local = Rz(yaw) * (map - offset). Measured in SITL: the drone spawned at map (13, 7)
+    # reports local ENU (-7, 13). SITL's origin is the Gazebo world origin, and
+    # gazeboXYZToNED = roll 180 deg makes world X = North, Y = West -> +90 deg, no offset.
+    map_offset: [0.0, 0.0, 0.0]
+    map_to_local_yaw_deg: 90.0
+
+    # --- A1.2 controller
+    rate_hz: 20.0
+    hard_tolerance: 0.15     # [m] must settle inside ...
+    hard_max_speed: 0.15     # [m/s] ... below this speed ...
+    hard_settle_time: 1.0    # [s] ... for this long
+    soft_tolerance: 0.40     # [m] fly through, no settling
+    pass_tolerance: 0.50     # [m] intermediate planner points
+    yaw_tolerance_deg: 5.0
+    max_speed: 1.0           # [m/s] speed of the moving setpoint along each segment
