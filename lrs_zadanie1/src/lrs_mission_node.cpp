@@ -1,3 +1,16 @@
+// Assignment 1 — one node for the whole mission.
+//
+//   A1.1  map.pcd -> pcl::VoxelGrid downsample -> dense 3D occupancy grid
+//         -> racks filled as solid boxes -> spherical inflation
+//         -> A* (26-connected) -> line-of-sight shortcutting
+//   A1.2  indoor mission from a CSV file: takeoff / land / landtakeoff / yawN
+//   A1.3  outdoor mission: GPS + compass, POI square, figure-8, return and land
+//
+// Frames
+//   map    frame of map.pcd and of the mission CSV (Gazebo world frame of the hangar)
+//   local  MAVROS local ENU (/mavros/local_position/pose)
+//   local = Rz(map_to_local_yaw) * (map - map_offset)
+// All yaw angles in this file are ENU radians (0 = East / map +X, counter-clockwise).
 
 #include <pcl/common/common.h>
 #include <pcl/filters/voxel_grid.h>
@@ -19,6 +32,12 @@
 #include "geometry_msgs/msg/point_stamped.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
+#include "mavros_msgs/msg/home_position.hpp"
+#include "mavros_msgs/msg/position_target.hpp"
+#include "mavros_msgs/msg/state.hpp"
+#include "mavros_msgs/srv/command_bool.hpp"
+#include "mavros_msgs/srv/command_tol.hpp"
+#include "mavros_msgs/srv/set_mode.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/nav_sat_fix.hpp"
@@ -29,6 +48,8 @@
 #include "std_srvs/srv/trigger.hpp"
 
 using namespace std::chrono_literals;
+
+// ---------------------------------------------------------------- helpers
 
 struct V3
 {
@@ -147,7 +168,94 @@ public:
   size_t count(const std::vector<uint8_t> & g) const {return std::count(g.begin(), g.end(), 1);}
 };
 
+// Nearest free voxel to p within 1 m, used when a waypoint lies in the inflation zone.
+bool nearestFree(const VoxelMap & m, V3 p, int & bi, int & bj, int & bk)
+{
+  int i, j, k;
+  m.toIndex(p, i, j, k);
+  if (m.freeIdx(i, j, k)) {bi = i; bj = j; bk = k; return true;}
+  const int r = static_cast<int>(1.0 / m.res);
+  double best = std::numeric_limits<double>::infinity();
+  for (int dz = -r; dz <= r; ++dz) {
+    for (int dy = -r; dy <= r; ++dy) {
+      for (int dx = -r; dx <= r; ++dx) {
+        const double d = dx * dx + dy * dy + dz * dz;
+        if (d < best && m.freeIdx(i + dx, j + dy, k + dz)) {
+          best = d; bi = i + dx; bj = j + dy; bk = k + dz;
+        }
+      }
+    }
+  }
+  return std::isfinite(best);
+}
 
+// A* over the 26-connected voxel grid. Edge cost = Euclidean length of the move,
+// heuristic = Euclidean distance to the goal: never overestimates -> admissible.
+// Terminates when the open list is empty (no path) since the grid is finite.
+bool astar(const VoxelMap & m, V3 start, V3 goal, std::vector<V3> & path)
+{
+  int si, sj, sk, gi, gj, gk;
+  if (!nearestFree(m, start, si, sj, sk) || !nearestFree(m, goal, gi, gj, gk)) {return false;}
+  const size_t n = m.inflated.size();
+  std::vector<float> g(n, std::numeric_limits<float>::infinity());
+  std::vector<int> parent(n, -1);
+  std::vector<uint8_t> closed(n, 0);
+  auto h = [&](int i, int j, int k) {
+      return static_cast<float>(m.res * std::sqrt(double((i - gi) * (i - gi) + (j - gj) * (j - gj) + (k - gk) * (k - gk))));
+    };
+  using Entry = std::pair<float, int>;  // (f, voxel id)
+  std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> open;
+  const int s = static_cast<int>(m.id(si, sj, sk)), goal_id = static_cast<int>(m.id(gi, gj, gk));
+  g[s] = 0;
+  open.push({h(si, sj, sk), s});
+
+  while (!open.empty()) {
+    const int cur = open.top().second;
+    open.pop();
+    if (closed[cur]) {continue;}
+    closed[cur] = 1;
+    if (cur == goal_id) {
+      path.clear();
+      for (int c = cur; c != -1; c = parent[c]) {
+        path.push_back(m.centre(c % m.nx, (c / m.nx) % m.ny, c / (m.nx * m.ny)));
+      }
+      std::reverse(path.begin(), path.end());
+      return true;
+    }
+    const int ci = cur % m.nx, cj = (cur / m.nx) % m.ny, ck = cur / (m.nx * m.ny);
+    for (int dz = -1; dz <= 1; ++dz) {
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          const int i = ci + dx, j = cj + dy, k = ck + dz;
+          if ((!dx && !dy && !dz) || !m.freeIdx(i, j, k)) {continue;}
+          const int nb = static_cast<int>(m.id(i, j, k));
+          const float cost = g[cur] + static_cast<float>(m.res * std::sqrt(double(dx * dx + dy * dy + dz * dz)));
+          if (cost < g[nb]) {
+            g[nb] = cost;
+            parent[nb] = cur;
+            open.push({cost + h(i, j, k), nb});
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// Line-of-sight shortcutting: from each kept point jump to the farthest later
+// point reachable in a straight collision-free line.
+std::vector<V3> simplify(const VoxelMap & m, const std::vector<V3> & path)
+{
+  std::vector<V3> out{path.front()};
+  size_t i = 0;
+  while (i + 1 < path.size()) {
+    size_t j = path.size() - 1;
+    while (j > i + 1 && !m.segmentFree(path[i], path[j])) {--j;}
+    out.push_back(path[j]);
+    i = j;
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------- A1.3 geodesy
 
@@ -168,6 +276,26 @@ struct Geo
   }
 };
 
+// ---------------------------------------------------------------- mission
+
+enum class Type { TAKEOFF, GOTO, YAW, LAND, FIGURE8 };
+enum class Tol { PASS, SOFT, HARD };
+
+struct Action
+{
+  Type type;
+  V3 pos;              // local ENU target (GOTO, YAW), takeoff altitude in pos.z
+  double yaw{0};       // YAW target
+  Tol tol{Tol::PASS};  // GOTO arrival condition
+  bool face_poi{false};
+  std::string label;
+};
+
+struct Row
+{
+  V3 p;
+  std::string precision, task;
+};
 
 std::vector<Row> readMission(const std::string & file)
 {
@@ -176,7 +304,7 @@ std::vector<Row> readMission(const std::string & file)
   std::vector<Row> rows;
   std::string line;
   while (std::getline(in, line)) {
-    if (line.empty() || line[0] == '#' || line[0] == 'x') {continue;} 
+    if (line.empty() || line[0] == '#' || line[0] == 'x') {continue;}  // comments, header
     std::replace(line.begin(), line.end(), ',', ' ');
     std::istringstream ss(line);
     Row r;
@@ -191,14 +319,46 @@ public:
   MissionNode()
   : Node("lrs_mission")
   {
-    mode_ = declare_parameter("mission", std::string("indoor"));
+    mode_ = declare_parameter("mission", std::string("indoor"));  // indoor | outdoor
     rate_hz_ = declare_parameter("rate_hz", 20.0);
+    hard_tol_ = declare_parameter("hard_tolerance", 0.15);
+    soft_tol_ = declare_parameter("soft_tolerance", 0.40);
+    pass_tol_ = declare_parameter("pass_tolerance", 0.50);
+    hard_speed_ = declare_parameter("hard_max_speed", 0.15);
+    settle_s_ = declare_parameter("hard_settle_time", 1.0);
+    yaw_tol_ = rad(declare_parameter("yaw_tolerance_deg", 5.0));
+    max_speed_ = declare_parameter("max_speed", 1.0);
 
+    auto qos = rclcpp::SensorDataQoS();
+    state_sub_ = create_subscription<mavros_msgs::msg::State>(
+      "/mavros/state", 10, [this](mavros_msgs::msg::State::ConstSharedPtr m) {state_ = *m;});
+    pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+      "/mavros/local_position/pose", qos, [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr m) {
+        pos_ = {m->pose.position.x, m->pose.position.y, m->pose.position.z};
+        const auto & q = m->pose.orientation;
+        yaw_ = std::atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z));
+        have_pose_ = true;
+      });
+    vel_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
+      "/mavros/local_position/velocity_local", qos, [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr m) {
+        vel_ = {m->twist.linear.x, m->twist.linear.y, m->twist.linear.z};
+        speed_ = norm(vel_);
+      });
+    sp_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>("/mavros/setpoint_raw/local", 10);
+    mode_cli_ = create_client<mavros_msgs::srv::SetMode>("/mavros/set_mode");
+    arm_cli_ = create_client<mavros_msgs::srv::CommandBool>("/mavros/cmd/arming");
+    takeoff_cli_ = create_client<mavros_msgs::srv::CommandTOL>("/mavros/cmd/takeoff");
+    land_cli_ = create_client<mavros_msgs::srv::CommandTOL>("/mavros/cmd/land");
+    abort_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/abort", [this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr res) {
+        abort("abort requested", true);
+        res->success = true;
+      });
 
     if (mode_ == "indoor") {
-      if (!setupIndoor()) {return;}
+      if (!setupIndoor()) {return;}  // plan_only or planning failed
     } else if (mode_ == "outdoor") {
-      //TODO
+      setupOutdoor();
     } else {
       throw std::runtime_error("parameter 'mission' must be indoor or outdoor");
     }
@@ -207,6 +367,7 @@ public:
   }
 
 private:
+  // ============================================================ A1.1 + A1.2 indoor
 
   bool setupIndoor()
   {
@@ -232,16 +393,103 @@ private:
     map_.build(*down, res);
     pcl::PointXYZ lo, hi;
     pcl::getMinMax3D(*cloud, lo, hi);
+    RCLCPP_INFO(get_logger(), "map %s: %zu points -> %zu after %.2f m voxel grid filter",
+      map_file.c_str(), cloud->size(), down->size(), res);
+    RCLCPP_INFO(get_logger(), "bounding box [%.2f %.2f %.2f] -> [%.2f %.2f %.2f] m, grid %d x %d x %d = %zu voxels",
+      lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, map_.nx, map_.ny, map_.nz, map_.raw.size());
 
     // --- racks: solid boxes, then inflation
     for (size_t i = 0; i + 5 < boxes.size(); i += 6) {
       map_.fillBox({boxes[i], boxes[i + 1], boxes[i + 2]}, {boxes[i + 3], boxes[i + 4], boxes[i + 5]});
     }
     map_.inflate(radius);
+    RCLCPP_INFO(get_logger(), "occupied voxels: %zu raw (+%zu rack boxes), %zu after %.2f m inflation, %.0f ms",
+      map_.count(map_.raw), boxes.size() / 6, map_.count(map_.inflated), radius, msSince(t));
 
+    // Occupancy queries: RViz "Publish Point" or `ros2 topic pub /lrs_mission/query ...`
+    auto on_query = [this](geometry_msgs::msg::PointStamped::ConstSharedPtr m) {
+        V3 p{m->point.x, m->point.y, m->point.z};
+        RCLCPP_INFO(get_logger(), "query (%.2f %.2f %.2f) map: %s", p.x, p.y, p.z,
+          map_.rawOccupied(p) ? "OCCUPIED" : map_.free(p) ? "FREE" : "OCCUPIED (inflation)");
+      };
+    query_sub_ = create_subscription<geometry_msgs::msg::PointStamped>("~/query", 10, on_query);
+    click_sub_ = create_subscription<geometry_msgs::msg::PointStamped>("/clicked_point", 10, on_query);
+
+    // --- plan between consecutive goals
+    std::vector<Row> rows;
+    if (start.size() == 3 && goal.size() == 3) {
+      rows = {{{start[0], start[1], start[2]}, "hard", "-"}, {{goal[0], goal[1], goal[2]}, "hard", "-"}};
+    } else {
+      rows = readMission(declare_parameter("mission_file", std::string("")));
+    }
+    if (rows.size() < 2) {throw std::runtime_error("need at least two waypoints");}
+
+    std::vector<std::vector<V3>> segments;
+    nav_msgs::msg::Path viz;
+    viz.header.frame_id = "map";
+    for (size_t i = 1; i < rows.size(); ++i) {
+      t = std::chrono::steady_clock::now();
+      std::vector<V3> raw_path;
+      if (!astar(map_, rows[i - 1].p, rows[i].p, raw_path)) {
+        RCLCPP_ERROR(get_logger(), "no path from waypoint %zu to %zu", i, i + 1);
+        return false;
+      }
+      const double plan_ms = msSince(t);
+      auto path = simplify(map_, raw_path);
+      bool ok = true;
+      for (size_t k = 1; k < path.size(); ++k) {ok = ok && map_.segmentFree(path[k - 1], path[k]);}
+      RCLCPP_INFO(get_logger(), "path %zu -> %zu: A* %.0f ms, %zu points -> %zu after shortcutting, collision check %s",
+        i, i + 1, plan_ms, raw_path.size(), path.size(), ok ? "OK" : "FAILED");
+      if (!ok) {return false;}
+      for (auto & p : path) {
+        RCLCPP_INFO(get_logger(), "    (%.2f, %.2f, %.2f)", p.x, p.y, p.z);
+        geometry_msgs::msg::PoseStamped ps;
+        ps.header.frame_id = "map";
+        ps.pose.position.x = p.x; ps.pose.position.y = p.y; ps.pose.position.z = p.z;
+        viz.poses.push_back(ps);
+      }
+      path.back() = rows[i].p;  // fly to the exact waypoint, not the voxel centre
+      segments.push_back(path);
+    }
     publishViz(viz);
+    if (plan_only || start.size() == 3) {return false;}
+
+    // --- build the action list (local frame)
+    const double map_yaw = map_yaw_;
+    actions_.push_back({Type::TAKEOFF, toLocal(rows[0].p), 0, Tol::HARD, false, "takeoff wp 1"});
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const auto & r = rows[i];
+      const std::string wp = "wp " + std::to_string(i + 1);
+      if (i > 0) {
+        const auto & seg = segments[i - 1];
+        for (size_t k = 1; k < seg.size(); ++k) {
+          const bool last = k + 1 == seg.size();
+          const Tol tol = !last ? Tol::PASS : r.precision == "hard" ? Tol::HARD : Tol::SOFT;
+          actions_.push_back({Type::GOTO, toLocal(seg[k]), 0, tol, false, last ? wp : wp + " via " + std::to_string(k)});
+        }
+      }
+      if (r.task.rfind("yaw", 0) == 0) {
+        // yawN: N degrees in the map frame, counter-clockwise from map +X
+        const double yaw = wrap(rad(std::stod(r.task.substr(3))) + map_yaw);
+        actions_.push_back({Type::YAW, toLocal(r.p), yaw, Tol::HARD, false, wp + " " + r.task});
+      } else if (r.task == "land") {
+        actions_.push_back({Type::LAND, toLocal(r.p), 0, Tol::HARD, false, wp + " land"});
+      } else if (r.task == "landtakeoff") {
+        actions_.push_back({Type::LAND, toLocal(r.p), 0, Tol::HARD, false, wp + " land"});
+        actions_.push_back({Type::TAKEOFF, toLocal(r.p), 0, Tol::HARD, false, wp + " takeoff"});
+      }
+    }
+    if (actions_.back().type != Type::LAND) {
+      actions_.push_back({Type::LAND, actions_.back().pos, 0, Tol::HARD, false, "final land"});
+    }
+    return true;
   }
 
+  V3 toLocal(V3 p) const
+  {
+    const V3 d = p - map_offset_;
+    return {std::cos(map_yaw_) * d.x - std::sin(map_yaw_) * d.y, std::sin(map_yaw_) * d.x + std::cos(map_yaw_) * d.y, d.z};
+  }
 
   void publishViz(const nav_msgs::msg::Path & path)
   {
@@ -269,47 +517,296 @@ private:
     cloud_pub_->publish(cloud);
   }
 
-  // ============================================================ A1.3 outdoor
+  // ============================================================ state machine
 
-  void setupOutdoor()
+  void tick()
   {
-    alt_ = declare_parameter("altitude", 5.0);
-    side_ = declare_parameter("square_side", 5.0);
-    amp_ = declare_parameter("figure8_amplitude", 3.0);
-    omega_ = declare_parameter("figure8_omega", 0.3);
-    laps_ = declare_parameter("figure8_laps", 1.0);
-    poi_offset_ = {declare_parameter("poi_east", 0.0), declare_parameter("poi_north", 5.0), 0.0};
-    poi_lat_ = declare_parameter("poi_lat", 0.0);  // used instead of the offset when non-zero
-    poi_lon_ = declare_parameter("poi_lon", 0.0);
-    min_sats_ = declare_parameter("min_satellites", 6);
+    if (phase_ == "DONE" || phase_ == "ABORTED") {return;}
+    if (phase_ != "WAIT_FOR_FCU" && !state_.connected) {return abort("MAVROS lost connection", false);}
 
-    auto qos = rclcpp::SensorDataQoS();
-    fix_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-      "/mavros/global_position/global", qos, [this](sensor_msgs::msg::NavSatFix::ConstSharedPtr m) {fix_ = *m;});
-    sats_sub_ = create_subscription<std_msgs::msg::UInt32>(
-      "/mavros/global_position/raw/satellites", qos, [this](std_msgs::msg::UInt32::ConstSharedPtr m) {sats_ = m->data;});
-    hdg_sub_ = create_subscription<std_msgs::msg::Float64>(
-      "/mavros/global_position/compass_hdg", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {hdg_ = m->data;});
-    relalt_sub_ = create_subscription<std_msgs::msg::Float64>(
-      "/mavros/global_position/rel_alt", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {rel_alt_ = m->data;});
-    home_sub_ = create_subscription<mavros_msgs::msg::HomePosition>(  // latched topic
-      "/mavros/home_position/home", rclcpp::QoS(1).transient_local(), [this](mavros_msgs::msg::HomePosition::ConstSharedPtr m) {
-        if (!home_) {
-          home_ = true;
-          geo_.lat0 = m->geo.latitude;
-          geo_.lon0 = m->geo.longitude;
-          home_local_ = {m->position.x, m->position.y, m->position.z};
-          RCLCPP_INFO(get_logger(), "home: lat %.7f lon %.7f alt %.2f, local (%.2f %.2f %.2f)",
-            geo_.lat0, geo_.lon0, m->geo.altitude, home_local_.x, home_local_.y, home_local_.z);
+    if (phase_ == "WAIT_FOR_FCU") {
+      if (!state_.connected || !have_pose_) {return;}
+      if (mode_ == "outdoor") {
+        if (!gpsReady()) {
+          RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "waiting for GPS fix / %d satellites / home (have %u)",
+            min_sats_, sats_);
+          return;
         }
-      });
-    status_timer_ = create_wall_timer(1s, [this] {printStatus();});
+        buildOutdoorActions();
+      }
+      return start(0);
+    }
+
+    Action & a = actions_[idx_];
+    const bool guided_flight = a.type == Type::GOTO || a.type == Type::YAW || a.type == Type::FIGURE8;
+    if (guided_flight && state_.mode != "GUIDED") {
+      return abort("mode changed to " + state_.mode + " by someone else, stopping setpoints", false);
+    }
+
+    switch (a.type) {
+      case Type::TAKEOFF: takeoff(a); break;
+      case Type::LAND: land(); break;
+      case Type::GOTO: go(a); break;
+      case Type::YAW: {
+          send(a.pos, a.yaw);
+          const bool ok = std::abs(wrap(a.yaw - yaw_)) < yaw_tol_;
+          if (ok && held(settle_s_)) {next();} else if (!ok) {since_ = now();}
+          break;
+        }
+      case Type::FIGURE8: figure8(a); break;
+    }
   }
 
-  VoxelMap map_;
-  std::string phase_{"WAIT_FOR_FCU"};
-  rclcpp::Time since_, t0_, last_call_{0, 0, RCL_ROS_TIME};
+  void start(size_t i)
+  {
+    idx_ = i;
+    step_ = 0;
+    since_ = now();
+    t0_ = now();
+    phase_ = "RUN";
+    const char * names[] = {"TAKEOFF", "NAVIGATE", "TASK_YAW", "LAND", "FIGURE8"};
+    log(std::string(names[static_cast<int>(actions_[i].type)]) + " (" + actions_[i].label + ")");
+    if (actions_[i].type == Type::GOTO) {
+      // Heading = direction of travel from the previous setpoint to this target.
+      seg_start_ = have_sp_ ? sp_pos_ : pos_;
+      const V3 d = actions_[i].pos - seg_start_;
+      travel_yaw_ = hnorm(d) > 0.3 ? std::atan2(d.y, d.x) : (have_sp_ ? sp_yaw_ : yaw_);
+    }
+  }
 
+  void next()
+  {
+    if (idx_ + 1 >= actions_.size()) {
+      phase_ = "DONE";
+      return log("DONE");
+    }
+    start(idx_ + 1);
+  }
+
+  // true once the current condition has held for `s` seconds (caller resets since_)
+  bool held(double s) {return (now() - since_).seconds() >= s;}
+
+  void takeoff(const Action & a)
+  {
+    have_sp_ = false;  // no setpoints during takeoff, ArduPilot's takeoff controller climbs
+    if (step_ >= 2 && !state_.armed) {step_ = 0;}  // disarmed after arming (e.g. timeout) -> start over
+    switch (step_) {
+      case 0:
+        if (state_.mode == "GUIDED") {step_ = 1; break;}
+        call<mavros_msgs::srv::SetMode>(mode_cli_, [](auto & r) {r.custom_mode = "GUIDED";},
+          [this](auto & r) {if (!r.mode_sent) {RCLCPP_WARN(get_logger(), "set GUIDED rejected");}});
+        break;
+      case 1:
+        if (state_.armed) {step_ = 2; break;}
+        call<mavros_msgs::srv::CommandBool>(arm_cli_, [](auto & r) {r.value = true;},
+          [this](auto & r) {if (!r.success) {RCLCPP_WARN(get_logger(), "arming rejected, see SITL console");}});
+        break;
+      case 2:
+        call<mavros_msgs::srv::CommandTOL>(takeoff_cli_,
+          [this, &a](auto & r) {r.altitude = static_cast<float>(a.pos.z - (mode_ == "outdoor" ? home_local_.z : 0.0));},
+          [this](auto & r) {
+            if (r.success) {step_ = 3;} else {RCLCPP_WARN(get_logger(), "takeoff rejected");}
+          });
+        break;
+      case 3:
+        if (pos_.z > a.pos.z - 0.15) {
+          RCLCPP_INFO(get_logger(), "airborne at %.2f m", pos_.z);
+          sp_pos_ = {pos_.x, pos_.y, a.pos.z};
+          sp_yaw_ = yaw_;
+          have_sp_ = true;
+          next();
+        }
+        break;
+    }
+  }
+
+  void land()
+  {
+    have_sp_ = false;
+    switch (step_) {
+      case 0:
+        call<mavros_msgs::srv::CommandTOL>(land_cli_, [](auto &) {},
+          [this](auto & r) {
+            if (r.success) {step_ = 1;} else {RCLCPP_WARN(get_logger(), "land rejected");}
+          });
+        break;
+      case 1:  // ArduPilot's LAND mode disarms by itself after touchdown
+        if (!state_.armed) {
+          RCLCPP_INFO(get_logger(), "landed and disarmed");
+          step_ = 2;
+          since_ = now();
+        }
+        break;
+      case 2:
+        if (held(2.0)) {next();}  // wait on the ground
+        break;
+    }
+  }
+
+  void go(const Action & a)
+  {
+    // Turn to the direction of travel before starting the segment (large turns only).
+    if (step_ == 0) {
+      if (!a.face_poi && std::abs(wrap(travel_yaw_ - yaw_)) > rad(30)) {
+        send(seg_start_, travel_yaw_);
+        if (std::abs(wrap(travel_yaw_ - yaw_)) > rad(10)) {return;}
+      }
+      step_ = 1;
+      t0_ = now();
+    }
+    // Carrot: the setpoint slides from the segment start to the target at max_speed,
+    // so the speed is bounded and the drone stays on the planned (collision-free) line.
+    const V3 seg = a.pos - seg_start_;
+    const double len = norm(seg);
+    const double s = std::min(len, max_speed_ * (now() - t0_).seconds());
+    const V3 carrot = len > 1e-3 ? seg_start_ + seg * (s / len) : a.pos;
+    if (a.face_poi) {
+      // Bearing to the POI, recomputed every tick, plus its rate of change as feed-forward:
+      // d = poi - pos, d' = -vel  ->  bearing' = (d.x * d'.y - d.y * d'.x) / |d|^2
+      const V3 d = poi_ - pos_;
+      const double r2 = std::max(d.x * d.x + d.y * d.y, 0.25);
+      send(carrot, std::atan2(d.y, d.x), (-d.x * vel_.y + d.y * vel_.x) / r2);
+    } else {
+      send(carrot, travel_yaw_);
+    }
+
+    const double err = norm(a.pos - pos_);
+    if (a.tol == Tol::PASS && err < pass_tol_) {return next();}
+    if (a.tol == Tol::SOFT && err < soft_tol_) {return next();}
+    if (a.tol == Tol::HARD) {
+      const bool ok = err < hard_tol_ && speed_ < hard_speed_;
+      if (!ok) {since_ = now();} else if (held(settle_s_)) {
+        RCLCPP_INFO(get_logger(), "settled at %s, error %.2f m", a.label.c_str(), err);
+        next();
+      }
+    }
+  }
+
+  void figure8(const Action & a)
+  {
+    const double t = omega_ * (now() - t0_).seconds();
+    if (t >= 2 * M_PI * laps_) {return next();}
+    const V3 p = a.pos + V3{amp_ * std::sin(t), amp_ * std::sin(t) * std::cos(t), 0};
+    // Tangent heading: (x', y') = (cos t, cos 2t) (times A), yaw = atan2(y', x').
+    // Its derivative is sent as yaw-rate feed-forward: omega * (x' y'' - y' x'') / (x'^2 + y'^2).
+    const double dx = std::cos(t), dy = std::cos(2 * t), ddx = -std::sin(t), ddy = -2 * std::sin(2 * t);
+    send(p, std::atan2(dy, dx), omega_ * (dx * ddy - dy * ddx) / (dx * dx + dy * dy));
+  }
+
+  // Position + yaw setpoint in local ENU (MAVROS converts to NED).
+  // yaw_rate [rad/s] is an optional feed-forward for ArduPilot's yaw controller.
+  void send(V3 p, double yaw, double yaw_rate = std::numeric_limits<double>::quiet_NaN())
+  {
+    yaw = have_sp_ ? sp_yaw_ + wrap(yaw - sp_yaw_) : yaw;  // unwrap: never jump by 2 pi
+    mavros_msgs::msg::PositionTarget sp;
+    sp.header.stamp = now();
+    sp.coordinate_frame = mavros_msgs::msg::PositionTarget::FRAME_LOCAL_NED;
+    sp.type_mask = mavros_msgs::msg::PositionTarget::IGNORE_VX | mavros_msgs::msg::PositionTarget::IGNORE_VY |
+      mavros_msgs::msg::PositionTarget::IGNORE_VZ | mavros_msgs::msg::PositionTarget::IGNORE_AFX |
+      mavros_msgs::msg::PositionTarget::IGNORE_AFY | mavros_msgs::msg::PositionTarget::IGNORE_AFZ |
+      (std::isnan(yaw_rate) ? mavros_msgs::msg::PositionTarget::IGNORE_YAW_RATE : 0);
+    sp.position.x = p.x;
+    sp.position.y = p.y;
+    sp.position.z = p.z;
+    sp.yaw = static_cast<float>(yaw);
+    sp.yaw_rate = std::isnan(yaw_rate) ? 0.0f : static_cast<float>(yaw_rate);
+    sp_pub_->publish(sp);
+    sp_pos_ = p;
+    sp_yaw_ = yaw;
+    have_sp_ = true;
+  }
+
+  void abort(const std::string & why, bool command_land)
+  {
+    if (phase_ == "DONE" || phase_ == "ABORTED") {return;}
+    phase_ = "ABORTED";
+    RCLCPP_ERROR(get_logger(), "ABORTED: %s", why.c_str());
+    if (command_land && mode_cli_->service_is_ready()) {
+      auto req = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+      req->custom_mode = "LAND";
+      mode_cli_->async_send_request(req);
+    }
+  }
+
+  // One service call in flight at a time, retried at most every second.
+  template<typename Srv, typename Client, typename Fill, typename Done>
+  void call(Client & cli, Fill fill, Done done)
+  {
+    const double since = (now() - last_call_).seconds();
+    if (pending_ && since > 5.0) {
+      RCLCPP_WARN(get_logger(), "no response from %s, retrying", cli->get_service_name());
+      cli->prune_pending_requests();
+      pending_ = false;
+    }
+    if (pending_ || since < 1.0) {return;}
+    if (!cli->service_is_ready()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000, "waiting for service %s", cli->get_service_name());
+      return;
+    }
+    auto req = std::make_shared<typename Srv::Request>();
+    fill(*req);
+    pending_ = true;
+    last_call_ = now();
+    RCLCPP_INFO(get_logger(), "-> %s", cli->get_service_name());
+    cli->async_send_request(req, [this, done](typename rclcpp::Client<Srv>::SharedFuture f) {
+        pending_ = false;
+        done(*f.get());
+      });
+  }
+
+  void log(const std::string & s) {RCLCPP_INFO(get_logger(), "[state] %s", s.c_str());}
+  static double msSince(std::chrono::steady_clock::time_point t)
+  {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+  }
+
+  // parameters
+  std::string mode_;
+  double rate_hz_, hard_tol_, soft_tol_, pass_tol_, hard_speed_, settle_s_, yaw_tol_, max_speed_;
+  double alt_{5}, side_{5}, amp_{3}, omega_{0.3}, laps_{1}, poi_lat_{0}, poi_lon_{0};
+  int min_sats_{6};
+  V3 poi_offset_, map_offset_;
+  double map_yaw_{0};
+
+  // telemetry
+  mavros_msgs::msg::State state_;
+  V3 pos_, vel_;
+  double yaw_{0}, speed_{0}, hdg_{0}, rel_alt_{0};
+  bool have_pose_{false};
+  sensor_msgs::msg::NavSatFix fix_;
+  unsigned sats_{0};
+  bool home_{false};
+  Geo geo_;
+  V3 home_local_, poi_;
+
+  // mission
+  VoxelMap map_;
+  std::vector<Action> actions_;
+  std::string phase_{"WAIT_FOR_FCU"};
+  size_t idx_{0};
+  int step_{0};
+  rclcpp::Time since_, t0_, last_call_{0, 0, RCL_ROS_TIME};
+  bool pending_{false};
+  V3 sp_pos_, seg_start_;
+  double sp_yaw_{0}, travel_yaw_{0};
+  bool have_sp_{false};
+
+  rclcpp::Subscription<mavros_msgs::msg::State>::SharedPtr state_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr vel_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr query_sub_, click_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr fix_sub_;
+  rclcpp::Subscription<std_msgs::msg::UInt32>::SharedPtr sats_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr hdg_sub_, relalt_sub_;
+  rclcpp::Subscription<mavros_msgs::msg::HomePosition>::SharedPtr home_sub_;
+  rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr sp_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
+  rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr mode_cli_;
+  rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arm_cli_;
+  rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedPtr takeoff_cli_, land_cli_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr abort_srv_;
+  rclcpp::TimerBase::SharedPtr timer_, status_timer_;
 };
 
 int main(int argc, char ** argv)
