@@ -12,6 +12,8 @@ lrs_mission:
     rack_boxes: [1.07,  6.29, 0.0, 7.57,  7.35, 4.10,
                  1.07, 10.83, 0.0, 7.57, 11.89, 4.10]
 
+    viz_map_max_z: 4.8       # [m] RViz only: hide the ceiling so the paths are visible from above
+
     # --- map -> MAVROS local ENU
     # local = Rz(yaw) * (map - offset). Measured in SITL: the drone spawned at map (13, 7)
     # reports local ENU (-7, 13). SITL's origin is the Gazebo world origin, and

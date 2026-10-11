@@ -45,8 +45,20 @@ ros2 run lrs_mission lrs_mission_node --ros-args --params-file install/lrs_missi
 ros2 topic pub --once /lrs_mission/query geometry_msgs/msg/PointStamped "{point: {x: 4.0, y: 6.8, z: 1.5}}"
 ```
 
-RViz, fixed frame `map`: `/lrs_mission/map` (PointCloud2) and `/lrs_mission/path` (Path),
-both with Durability *Transient Local*.
+### RViz
+
+Both launch files start RViz with [rviz/lrs_mission.rviz](rviz/lrs_mission.rviz). Pass `rviz:=false` to
+skip it. Every topic is latched, so RViz can also be started later:
+
+| Topic | Type | Shows |
+|---|---|---|
+| `/lrs_mission/map` | PointCloud2 | map voxels incl. rack boxes. The view is cropped at `viz_map_max_z` so the ceiling doesn't hide the inside |
+| `/lrs_mission/path` | Path (blue) | indoor: planned path after shortcutting. Outdoor: commanded square + figure-8 |
+| `/lrs_mission/flown_path` | Path (orange) | actual drone position, a pose every 5 cm, updated at 2 Hz |
+| `/lrs_mission/waypoints` | MarkerArray | mission waypoints, red = `hard`, green = `soft`, labelled with number, precision and task |
+
+Frame `map` is the frame of `map.pcd` indoors. The flown track is converted there from MAVROS
+local ENU. Outdoors, `map` is the MAVROS local ENU frame.
 
 Parameters: [config/indoor.yaml](config/indoor.yaml), [config/outdoor.yaml](config/outdoor.yaml).
 

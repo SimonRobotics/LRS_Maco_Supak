@@ -1,0 +1,81 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 30
+      Color: 160; 160; 164
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Map
+      Enabled: true
+      Style: Boxes
+      Size (m): 0.1
+      Alpha: 0.15
+      Color Transformer: FlatColor
+      Color: 200; 200; 200
+      Topic:
+        Value: /lrs_mission/map
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: Planned path
+      Enabled: true
+      Color: 25; 200; 255
+      Line Style: Billboards
+      Line Width: 0.08
+      Alpha: 1
+      Buffer Length: 1
+      Pose Style: None
+      Topic:
+        Value: /lrs_mission/path
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/Path
+      Name: Flown path
+      Enabled: true
+      Color: 255; 140; 0
+      Line Style: Billboards
+      Line Width: 0.08
+      Alpha: 1
+      Buffer Length: 1
+      Pose Style: None
+      Topic:
+        Value: /lrs_mission/flown_path
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Waypoints
+      Enabled: true
+      Topic:
+        Value: /lrs_mission/waypoints
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/PublishPoint
+      Topic:
+        Value: /clicked_point
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 22
+      Focal Point: {X: 8, Y: 6, Z: 1}
+      Pitch: 1.1
+      Yaw: -1.2

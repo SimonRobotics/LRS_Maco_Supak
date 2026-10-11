@@ -46,6 +46,7 @@
 #include "std_msgs/msg/float64.hpp"
 #include "std_msgs/msg/u_int32.hpp"
 #include "std_srvs/srv/trigger.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 using namespace std::chrono_literals;
 
@@ -338,6 +339,7 @@ public:
         const auto & q = m->pose.orientation;
         yaw_ = std::atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z));
         have_pose_ = true;
+        recordFlown();
       });
     vel_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
       "/mavros/local_position/velocity_local", qos, [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr m) {
@@ -345,6 +347,16 @@ public:
         speed_ = norm(vel_);
       });
     sp_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>("/mavros/setpoint_raw/local", 10);
+    // RViz (fixed frame "map"), latched so RViz can be started at any time
+    const auto latched = rclcpp::QoS(1).transient_local();
+    path_pub_ = create_publisher<nav_msgs::msg::Path>("~/path", latched);
+    flown_pub_ = create_publisher<nav_msgs::msg::Path>("~/flown_path", latched);
+    wp_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("~/waypoints", latched);
+    cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("~/map", latched);
+    flown_.header.frame_id = "map";
+    viz_timer_ = create_wall_timer(500ms, [this] {
+        if (flown_changed_) {flown_pub_->publish(flown_); flown_changed_ = false;}
+      });
     mode_cli_ = create_client<mavros_msgs::srv::SetMode>("/mavros/set_mode");
     arm_cli_ = create_client<mavros_msgs::srv::CommandBool>("/mavros/cmd/arming");
     takeoff_cli_ = create_client<mavros_msgs::srv::CommandTOL>("/mavros/cmd/takeoff");
@@ -425,8 +437,7 @@ private:
     if (rows.size() < 2) {throw std::runtime_error("need at least two waypoints");}
 
     std::vector<std::vector<V3>> segments;
-    nav_msgs::msg::Path viz;
-    viz.header.frame_id = "map";
+    std::vector<V3> planned;
     for (size_t i = 1; i < rows.size(); ++i) {
       t = std::chrono::steady_clock::now();
       std::vector<V3> raw_path;
@@ -443,15 +454,19 @@ private:
       if (!ok) {return false;}
       for (auto & p : path) {
         RCLCPP_INFO(get_logger(), "    (%.2f, %.2f, %.2f)", p.x, p.y, p.z);
-        geometry_msgs::msg::PoseStamped ps;
-        ps.header.frame_id = "map";
-        ps.pose.position.x = p.x; ps.pose.position.y = p.y; ps.pose.position.z = p.z;
-        viz.poses.push_back(ps);
+        planned.push_back(p);
       }
       path.back() = rows[i].p;  // fly to the exact waypoint, not the voxel centre
       segments.push_back(path);
     }
-    publishViz(viz);
+    publishMap(declare_parameter("viz_map_max_z", 4.8));
+    publishPath(planned);
+    std::vector<Waypoint> wps;
+    for (size_t i = 0; i < rows.size(); ++i) {
+      wps.push_back({rows[i].p, std::to_string(i + 1) + " " + rows[i].precision + " " + rows[i].task,
+          rows[i].precision == "hard"});
+    }
+    publishWaypoints(wps);
     if (plan_only || start.size() == 3) {return false;}
 
     // --- build the action list (local frame)
@@ -491,29 +506,112 @@ private:
     return {std::cos(map_yaw_) * d.x - std::sin(map_yaw_) * d.y, std::sin(map_yaw_) * d.x + std::cos(map_yaw_) * d.y, d.z};
   }
 
-  void publishViz(const nav_msgs::msg::Path & path)
+  // Inverse of toLocal. Outdoors map_yaw_ = 0 and map_offset_ = 0, so "map" = MAVROS local ENU.
+  V3 toMap(V3 p) const
   {
-    auto latched = rclcpp::QoS(1).transient_local();
-    path_pub_ = create_publisher<nav_msgs::msg::Path>("~/path", latched);
-    cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("~/map", latched);
-    path_pub_->publish(path);
+    const V3 d{std::cos(map_yaw_) * p.x + std::sin(map_yaw_) * p.y, -std::sin(map_yaw_) * p.x + std::cos(map_yaw_) * p.y, p.z};
+    return d + map_offset_;
+  }
 
+  // ============================================================ RViz
+
+  struct Waypoint
+  {
+    V3 p;  // map frame
+    std::string label;
+    bool hard;
+  };
+
+  static geometry_msgs::msg::PoseStamped toPose(V3 p)
+  {
+    geometry_msgs::msg::PoseStamped ps;
+    ps.header.frame_id = "map";
+    ps.pose.position.x = p.x;
+    ps.pose.position.y = p.y;
+    ps.pose.position.z = p.z;
+    ps.pose.orientation.w = 1.0;
+    return ps;
+  }
+
+  void publishPath(const std::vector<V3> & pts)
+  {
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "map";
+    path.header.stamp = now();
+    for (const auto & p : pts) {path.poses.push_back(toPose(p));}
+    path_pub_->publish(path);
+  }
+
+  // Spheres (red = hard, green = soft) with a text label above each.
+  void publishWaypoints(const std::vector<Waypoint> & wps)
+  {
+    visualization_msgs::msg::MarkerArray arr;
+    visualization_msgs::msg::Marker clear;
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    arr.markers.push_back(clear);
+    for (size_t i = 0; i < wps.size(); ++i) {
+      visualization_msgs::msg::Marker m;
+      m.header.frame_id = "map";
+      m.header.stamp = now();
+      m.ns = "waypoints";
+      m.id = static_cast<int>(i);
+      m.type = visualization_msgs::msg::Marker::SPHERE;
+      m.pose = toPose(wps[i].p).pose;
+      m.scale.x = m.scale.y = m.scale.z = 0.3;
+      m.color.r = wps[i].hard ? 0.9f : 0.1f;
+      m.color.g = wps[i].hard ? 0.1f : 0.8f;
+      m.color.b = 0.1f;
+      m.color.a = 0.9f;
+      arr.markers.push_back(m);
+
+      m.ns = "labels";
+      m.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      m.pose.position.z += 0.4;
+      m.scale.x = m.scale.y = 0.0;
+      m.scale.z = 0.35;  // text height
+      m.color.r = m.color.g = m.color.b = 1.0f;
+      m.text = wps[i].label;
+      arr.markers.push_back(m);
+    }
+    wp_pub_->publish(arr);
+  }
+
+  // Actual track: a new pose every 5 cm while the mission runs, published at 2 Hz.
+  void recordFlown()
+  {
+    if (phase_ != "RUN") {return;}
+    const V3 p = toMap(pos_);
+    if (!flown_.poses.empty()) {
+      const auto & last = flown_.poses.back().pose.position;
+      if (norm(p - V3{last.x, last.y, last.z}) < 0.05) {return;}
+    }
+    flown_.poses.push_back(toPose(p));
+    flown_.header.stamp = now();
+    flown_changed_ = true;
+  }
+
+  // Map voxels for RViz, cropped at max_z so the ceiling does not hide the inside.
+  void publishMap(double max_z)
+  {
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header.frame_id = "map";
     sensor_msgs::PointCloud2Modifier mod(cloud);
     mod.setPointCloud2FieldsByString(1, "xyz");
-    mod.resize(map_.count(map_.raw));
+    mod.resize(map_.count(map_.raw));  // upper bound, shrunk below
     sensor_msgs::PointCloud2Iterator<float> x(cloud, "x"), y(cloud, "y"), z(cloud, "z");
+    size_t n = 0;
     for (int k = 0; k < map_.nz; ++k) {
       for (int j = 0; j < map_.ny; ++j) {
         for (int i = 0; i < map_.nx; ++i) {
-          if (!map_.raw[map_.id(i, j, k)]) {continue;}
           const V3 c = map_.centre(i, j, k);
+          if (!map_.raw[map_.id(i, j, k)] || c.z > max_z) {continue;}
           *x = c.x; *y = c.y; *z = c.z;
           ++x; ++y; ++z;
+          ++n;
         }
       }
     }
+    mod.resize(n);
     cloud_pub_->publish(cloud);
   }
 
@@ -586,6 +684,23 @@ private:
     actions_.push_back({Type::FIGURE8, poi_ + up, 0, Tol::PASS, false, "figure-8"});
     actions_.push_back({Type::GOTO, home_local_ + up, 0, Tol::HARD, false, "return to launch"});
     actions_.push_back({Type::LAND, home_local_, 0, Tol::HARD, false, "land"});
+
+    // RViz: commanded trajectory (takeoff, square, centre, figure-8, return) and waypoints.
+    std::vector<V3> traj{home_local_};
+    std::vector<Waypoint> wps{{home_local_, "home", true}, {poi_, "POI", true}};
+    for (const auto & a : actions_) {
+      if (a.type == Type::GOTO || a.type == Type::TAKEOFF) {traj.push_back(a.pos);}
+      if (a.type == Type::GOTO) {wps.push_back({a.pos, a.label, a.tol == Tol::HARD});}
+      if (a.type == Type::FIGURE8) {
+        for (int k = 0; k <= 200; ++k) {
+          const double t = 2 * M_PI * k / 200;
+          traj.push_back(a.pos + V3{amp_ * std::sin(t), amp_ * std::sin(t) * std::cos(t), 0});
+        }
+      }
+    }
+    traj.push_back(home_local_);
+    publishPath(traj);
+    publishWaypoints(wps);
   }
 
   void printStatus()
@@ -885,13 +1000,16 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr hdg_sub_, relalt_sub_;
   rclcpp::Subscription<mavros_msgs::msg::HomePosition>::SharedPtr home_sub_;
   rclcpp::Publisher<mavros_msgs::msg::PositionTarget>::SharedPtr sp_pub_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_, flown_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr wp_pub_;
+  nav_msgs::msg::Path flown_;
+  bool flown_changed_{false};
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr mode_cli_;
   rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr arm_cli_;
   rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedPtr takeoff_cli_, land_cli_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr abort_srv_;
-  rclcpp::TimerBase::SharedPtr timer_, status_timer_;
+  rclcpp::TimerBase::SharedPtr timer_, status_timer_, viz_timer_;
 };
 
 int main(int argc, char ** argv)
