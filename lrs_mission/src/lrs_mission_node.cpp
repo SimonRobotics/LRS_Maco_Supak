@@ -24,6 +24,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <sstream>
 #include <string>
@@ -320,6 +321,15 @@ public:
   MissionNode()
   : Node("lrs_mission")
   {
+    // Two MutuallyExclusive groups run concurrently on the MultiThreadedExecutor in main().
+    // cb_control_ gets tick(), the MAVROS service replies and ~/abort, so everything that
+    // mutates the state machine is serialised by the executor itself and needs no lock.
+    // cb_sensors_ gets every subscription; mtx_ guards only what they write and the other
+    // groups read -- the sensor snapshot and flown_.
+    cb_control_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    cb_sensors_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    sensor_opts_.callback_group = cb_sensors_;
+
     mode_ = declare_parameter("mission", std::string("indoor"));  // indoor | outdoor
     rate_hz_ = declare_parameter("rate_hz", 20.0);
     hard_tol_ = declare_parameter("hard_tolerance", 0.15);
@@ -332,20 +342,25 @@ public:
 
     auto qos = rclcpp::SensorDataQoS();
     state_sub_ = create_subscription<mavros_msgs::msg::State>(
-      "/mavros/state", 10, [this](mavros_msgs::msg::State::ConstSharedPtr m) {state_ = *m;});
+      "/mavros/state", 10, [this](mavros_msgs::msg::State::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        state_ = *m;
+      }, sensor_opts_);
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
       "/mavros/local_position/pose", qos, [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
         pos_ = {m->pose.position.x, m->pose.position.y, m->pose.position.z};
         const auto & q = m->pose.orientation;
         yaw_ = std::atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z));
         have_pose_ = true;
         recordFlown();
-      });
+      }, sensor_opts_);
     vel_sub_ = create_subscription<geometry_msgs::msg::TwistStamped>(
       "/mavros/local_position/velocity_local", qos, [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
         vel_ = {m->twist.linear.x, m->twist.linear.y, m->twist.linear.z};
         speed_ = norm(vel_);
-      });
+      }, sensor_opts_);
     sp_pub_ = create_publisher<mavros_msgs::msg::PositionTarget>("/mavros/setpoint_raw/local", 10);
     // RViz (fixed frame "map"), latched so RViz can be started at any time
     const auto latched = rclcpp::QoS(1).transient_local();
@@ -355,17 +370,36 @@ public:
     cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("~/map", latched);
     flown_.header.frame_id = "map";
     viz_timer_ = create_wall_timer(500ms, [this] {
-        if (flown_changed_) {flown_pub_->publish(flown_); flown_changed_ = false;}
+        nav_msgs::msg::Path snapshot;
+        {
+          std::lock_guard<std::mutex> lk(mtx_);
+          if (!flown_changed_) {return;}
+          snapshot = flown_;
+          flown_changed_ = false;
+        }
+        // Serialising a Path of >1000 poses must not happen under mtx_, or the 20 Hz tick()
+        // would wait for it -- which is the stall the callback groups exist to avoid.
+        flown_pub_->publish(snapshot);
       });
-    mode_cli_ = create_client<mavros_msgs::srv::SetMode>("/mavros/set_mode");
-    arm_cli_ = create_client<mavros_msgs::srv::CommandBool>("/mavros/cmd/arming");
-    takeoff_cli_ = create_client<mavros_msgs::srv::CommandTOL>("/mavros/cmd/takeoff");
-    land_cli_ = create_client<mavros_msgs::srv::CommandTOL>("/mavros/cmd/land");
+    // The replies land in cb_control_, so they cannot run while tick() is running and
+    // may touch step_ / pending_ / phase_ without a lock.
+    mode_cli_ = create_client<mavros_msgs::srv::SetMode>(
+      "/mavros/set_mode", rclcpp::ServicesQoS(), cb_control_);
+    arm_cli_ = create_client<mavros_msgs::srv::CommandBool>(
+      "/mavros/cmd/arming", rclcpp::ServicesQoS(), cb_control_);
+    takeoff_cli_ = create_client<mavros_msgs::srv::CommandTOL>(
+      "/mavros/cmd/takeoff", rclcpp::ServicesQoS(), cb_control_);
+    land_cli_ = create_client<mavros_msgs::srv::CommandTOL>(
+      "/mavros/cmd/land", rclcpp::ServicesQoS(), cb_control_);
     abort_srv_ = create_service<std_srvs::srv::Trigger>(
       "~/abort", [this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr res) {
+        // Lock needed: abort() writes phase_, which recordFlown() reads from cb_sensors_.
+        // (The service *replies* above touch only step_/pending_, which cb_sensors_ never
+        // reads, and cb_control_ already serialises them against tick().)
+        std::lock_guard<std::mutex> lk(mtx_);
         abort("abort requested", true);
         res->success = true;
-      });
+      }, rclcpp::ServicesQoS(), cb_control_);
 
     if (mode_ == "indoor") {
       if (!setupIndoor()) {return;}  // plan_only or planning failed
@@ -374,8 +408,11 @@ public:
     } else {
       throw std::runtime_error("parameter 'mission' must be indoor or outdoor");
     }
-    timer_ = create_wall_timer(std::chrono::duration<double>(1.0 / rate_hz_), [this] {tick();});
-    log("WAIT_FOR_FCU");
+    timer_ = create_wall_timer(std::chrono::duration<double>(1.0 / rate_hz_), [this] {
+        std::lock_guard<std::mutex> lk(mtx_);  // tick() reads the sensor snapshot
+        tick();
+      }, cb_control_);
+    log("IDLE (waiting for FCU connection, pose and -- outdoors -- a GPS fix)");
   }
 
 private:
@@ -424,8 +461,11 @@ private:
         RCLCPP_INFO(get_logger(), "query (%.2f %.2f %.2f) map: %s", p.x, p.y, p.z,
           map_.rawOccupied(p) ? "OCCUPIED" : map_.free(p) ? "FREE" : "OCCUPIED (inflation)");
       };
-    query_sub_ = create_subscription<geometry_msgs::msg::PointStamped>("~/query", 10, on_query);
-    click_sub_ = create_subscription<geometry_msgs::msg::PointStamped>("/clicked_point", 10, on_query);
+    // No lock needed: on_query only reads map_, which is immutable once it is built below.
+    query_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
+      "~/query", 10, on_query, sensor_opts_);
+    click_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
+      "/clicked_point", 10, on_query, sensor_opts_);
 
     // --- plan between consecutive goals
     std::vector<Row> rows;
@@ -631,16 +671,29 @@ private:
 
     auto qos = rclcpp::SensorDataQoS();
     fix_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-      "/mavros/global_position/global", qos, [this](sensor_msgs::msg::NavSatFix::ConstSharedPtr m) {fix_ = *m;});
+      "/mavros/global_position/global", qos, [this](sensor_msgs::msg::NavSatFix::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        fix_ = *m;
+      }, sensor_opts_);
     sats_sub_ = create_subscription<std_msgs::msg::UInt32>(
-      "/mavros/global_position/raw/satellites", qos, [this](std_msgs::msg::UInt32::ConstSharedPtr m) {sats_ = m->data;});
+      "/mavros/global_position/raw/satellites", qos, [this](std_msgs::msg::UInt32::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        sats_ = m->data;
+      }, sensor_opts_);
     hdg_sub_ = create_subscription<std_msgs::msg::Float64>(
-      "/mavros/global_position/compass_hdg", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {hdg_ = m->data;});
+      "/mavros/global_position/compass_hdg", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        hdg_ = m->data;
+      }, sensor_opts_);
     relalt_sub_ = create_subscription<std_msgs::msg::Float64>(
-      "/mavros/global_position/rel_alt", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {rel_alt_ = m->data;});
+      "/mavros/global_position/rel_alt", qos, [this](std_msgs::msg::Float64::ConstSharedPtr m) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        rel_alt_ = m->data;
+      }, sensor_opts_);
     home_sub_ = create_subscription<mavros_msgs::msg::HomePosition>(  // latched topic
       "/mavros/home_position/home", rclcpp::QoS(1).transient_local(), [this](mavros_msgs::msg::HomePosition::ConstSharedPtr m) {
-        if (!home_) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!home_) {  // one-shot, so logging under the lock is fine here
           home_ = true;
           geo_.lat0 = m->geo.latitude;
           geo_.lon0 = m->geo.longitude;
@@ -648,7 +701,7 @@ private:
           RCLCPP_INFO(get_logger(), "home: lat %.7f lon %.7f alt %.2f, local (%.2f %.2f %.2f)",
             geo_.lat0, geo_.lon0, m->geo.altitude, home_local_.x, home_local_.y, home_local_.z);
         }
-      });
+      }, sensor_opts_);
     status_timer_ = create_wall_timer(1s, [this] {printStatus();});
   }
 
@@ -705,16 +758,34 @@ private:
 
   void printStatus()
   {
-    if (!home_ || !have_pose_) {return;}
-    const V3 gps = geo_.toEnu(fix_.latitude, fix_.longitude);
-    const V3 loc = pos_ - home_local_;
+    // Runs in the default group. Take a copy of the snapshot, then format and log without
+    // the lock -- RCLCPP_INFO with this many arguments is far too slow to hold mtx_ across.
+    sensor_msgs::msg::NavSatFix fix;
+    Geo geo;
+    V3 pos, home_local;
+    double rel_alt, hdg, yaw;
+    unsigned sats;
+    {
+      std::lock_guard<std::mutex> lk(mtx_);
+      if (!home_ || !have_pose_) {return;}
+      fix = fix_;
+      geo = geo_;
+      pos = pos_;
+      home_local = home_local_;
+      rel_alt = rel_alt_;
+      hdg = hdg_;
+      yaw = yaw_;
+      sats = sats_;
+    }
+    const V3 gps = geo.toEnu(fix.latitude, fix.longitude);
+    const V3 loc = pos - home_local;
     double lat, lon;
-    geo_.toGeo(loc, lat, lon);
+    geo.toGeo(loc, lat, lon);
     RCLCPP_INFO(get_logger(),
       "GPS lat %.7f lon %.7f amsl %.2f -> ENU (%.2f %.2f) | local ENU from home (%.2f %.2f %.2f) -> lat %.7f lon %.7f"
       " | rel_alt %.2f | compass %.1f deg (N, CW) -> ENU yaw %.1f deg, pose yaw %.1f deg (E, CCW) | sats %u",
-      fix_.latitude, fix_.longitude, fix_.altitude, gps.x, gps.y, loc.x, loc.y, loc.z, lat, lon, rel_alt_, hdg_,
-      deg(wrap(rad(90.0 - hdg_))), deg(yaw_), sats_);
+      fix.latitude, fix.longitude, fix.altitude, gps.x, gps.y, loc.x, loc.y, loc.z, lat, lon, rel_alt, hdg,
+      deg(wrap(rad(90.0 - hdg))), deg(yaw), sats);
   }
 
   // ============================================================ state machine
@@ -722,9 +793,9 @@ private:
   void tick()
   {
     if (phase_ == "DONE" || phase_ == "ABORTED") {return;}
-    if (phase_ != "WAIT_FOR_FCU" && !state_.connected) {return abort("MAVROS lost connection", false);}
+    if (phase_ != "IDLE" && !state_.connected) {return abort("MAVROS lost connection", false);}
 
-    if (phase_ == "WAIT_FOR_FCU") {
+    if (phase_ == "IDLE") {
       if (!state_.connected || !have_pose_) {return;}
       if (mode_ == "outdoor") {
         if (!gpsReady()) {
@@ -738,8 +809,7 @@ private:
     }
 
     Action & a = actions_[idx_];
-    const bool guided_flight = a.type == Type::GOTO || a.type == Type::YAW || a.type == Type::FIGURE8;
-    if (guided_flight && state_.mode != "GUIDED") {
+    if (!modeAllowed(a)) {
       return abort("mode changed to " + state_.mode + " by someone else, stopping setpoints", false);
     }
 
@@ -764,7 +834,8 @@ private:
     since_ = now();
     t0_ = now();
     phase_ = "RUN";
-    const char * names[] = {"TAKEOFF", "NAVIGATE", "TASK_YAW", "LAND", "FIGURE8"};
+    // Indexed by Type. TAKEOFF's first sub-state is SET_MODE, so that is what is logged.
+    const char * names[] = {"SET_MODE", "NAVIGATE", "TASK_YAW", "LAND", "FIGURE8"};
     log(std::string(names[static_cast<int>(actions_[i].type)]) + " (" + actions_[i].label + ")");
     if (actions_[i].type == Type::GOTO) {
       // Heading = direction of travel from the previous setpoint to this target.
@@ -786,29 +857,62 @@ private:
   // true once the current condition has held for `s` seconds (caller resets since_)
   bool held(double s) {return (now() - since_).seconds() >= s;}
 
+  // Sub-states of TAKEOFF and LAND. They are logged like the main states, so the log says
+  // where a mission stopped instead of only "-> /mavros/set_mode".
+  enum TakeoffStep { TK_SET_MODE, TK_ARM, TK_COMMAND, TK_CLIMB };
+  enum LandStep { LD_COMMAND, LD_DESCEND, LD_GROUND };
+
+  void setStep(int s, const char * name)
+  {
+    step_ = s;
+    log(std::string(name) + " (" + actions_[idx_].label + ")");
+  }
+
+  // Which FCU modes are legitimate while the current action runs. Anything else means
+  // someone else -- the safety pilot on the RC -- took over, so we stop commanding instead
+  // of fighting them (A1.3 section 6).
+  bool modeAllowed(const Action & a) const
+  {
+    switch (a.type) {
+      case Type::TAKEOFF:
+        // Below TK_ARM we are still trying to reach GUIDED, so any mode is expected.
+        return step_ < TK_ARM || state_.mode == "GUIDED";
+      case Type::LAND:
+        // cmd/land switches the FCU to LAND, but /mavros/state keeps reporting the previous
+        // GUIDED for a few cycles afterwards, so both are legitimate here.
+        return state_.mode == "LAND" || state_.mode == "GUIDED";
+      default:
+        return state_.mode == "GUIDED";  // GOTO, YAW, FIGURE8
+    }
+  }
+
   void takeoff(const Action & a)
   {
     have_sp_ = false;  // no setpoints during takeoff, ArduPilot's takeoff controller climbs
-    if (step_ >= 2 && !state_.armed) {step_ = 0;}  // disarmed after arming (e.g. timeout) -> start over
+    if (step_ >= TK_COMMAND && !state_.armed) {  // disarmed after arming (e.g. arming timeout)
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+        "disarmed during takeoff, restarting from SET_MODE");
+      step_ = TK_SET_MODE;
+    }
     switch (step_) {
-      case 0:
-        if (state_.mode == "GUIDED") {step_ = 1; break;}
+      case TK_SET_MODE:
+        if (state_.mode == "GUIDED") {setStep(TK_ARM, "ARM"); break;}
         call<mavros_msgs::srv::SetMode>(mode_cli_, [](auto & r) {r.custom_mode = "GUIDED";},
           [this](auto & r) {if (!r.mode_sent) {RCLCPP_WARN(get_logger(), "set GUIDED rejected");}});
         break;
-      case 1:
-        if (state_.armed) {step_ = 2; break;}
+      case TK_ARM:
+        if (state_.armed) {setStep(TK_COMMAND, "TAKEOFF"); break;}
         call<mavros_msgs::srv::CommandBool>(arm_cli_, [](auto & r) {r.value = true;},
           [this](auto & r) {if (!r.success) {RCLCPP_WARN(get_logger(), "arming rejected, see SITL console");}});
         break;
-      case 2:
+      case TK_COMMAND:
         call<mavros_msgs::srv::CommandTOL>(takeoff_cli_,
           [this, &a](auto & r) {r.altitude = static_cast<float>(a.pos.z - (mode_ == "outdoor" ? home_local_.z : 0.0));},
           [this](auto & r) {
-            if (r.success) {step_ = 3;} else {RCLCPP_WARN(get_logger(), "takeoff rejected");}
+            if (r.success) {setStep(TK_CLIMB, "CLIMB");} else {RCLCPP_WARN(get_logger(), "takeoff rejected");}
           });
         break;
-      case 3:
+      case TK_CLIMB:
         if (pos_.z > a.pos.z - 0.15) {
           RCLCPP_INFO(get_logger(), "airborne at %.2f m", pos_.z);
           sp_pos_ = {pos_.x, pos_.y, a.pos.z};
@@ -824,20 +928,20 @@ private:
   {
     have_sp_ = false;
     switch (step_) {
-      case 0:
+      case LD_COMMAND:
         call<mavros_msgs::srv::CommandTOL>(land_cli_, [](auto &) {},
           [this](auto & r) {
-            if (r.success) {step_ = 1;} else {RCLCPP_WARN(get_logger(), "land rejected");}
+            if (r.success) {setStep(LD_DESCEND, "DESCEND");} else {RCLCPP_WARN(get_logger(), "land rejected");}
           });
         break;
-      case 1:  // ArduPilot's LAND mode disarms by itself after touchdown
+      case LD_DESCEND:  // ArduPilot's LAND mode disarms by itself after touchdown
         if (!state_.armed) {
           RCLCPP_INFO(get_logger(), "landed and disarmed");
-          step_ = 2;
+          setStep(LD_GROUND, "ON_GROUND");
           since_ = now();
         }
         break;
-      case 2:
+      case LD_GROUND:
         if (held(2.0)) {next();}  // wait on the ground
         break;
     }
@@ -982,7 +1086,7 @@ private:
   // mission
   VoxelMap map_;
   std::vector<Action> actions_;
-  std::string phase_{"WAIT_FOR_FCU"};
+  std::string phase_{"IDLE"};
   size_t idx_{0};
   int step_{0};
   rclcpp::Time since_, t0_, last_call_{0, 0, RCL_ROS_TIME};
@@ -1010,12 +1114,26 @@ private:
   rclcpp::Client<mavros_msgs::srv::CommandTOL>::SharedPtr takeoff_cli_, land_cli_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr abort_srv_;
   rclcpp::TimerBase::SharedPtr timer_, status_timer_, viz_timer_;
+
+  // Threading (see the top of the constructor). mtx_ guards exactly the members the
+  // cb_sensors_ callbacks write and the other groups read: state_, pos_, yaw_, have_pose_,
+  // vel_, speed_, fix_, sats_, hdg_, rel_alt_, home_, geo_, home_local_, flown_ and
+  // flown_changed_. The state machine's own members need no lock, because tick(), the
+  // service replies and ~/abort all run in the MutuallyExclusive cb_control_ group.
+  rclcpp::CallbackGroup::SharedPtr cb_control_, cb_sensors_;
+  rclcpp::SubscriptionOptions sensor_opts_;
+  std::mutex mtx_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<MissionNode>());
+  auto node = std::make_shared<MissionNode>();
+  // Three groups can each run one callback at a time -- cb_control_, cb_sensors_ and the
+  // default group (RViz/status timers, parameter services) -- so four threads is enough.
+  rclcpp::executors::MultiThreadedExecutor exec(rclcpp::ExecutorOptions(), 4);
+  exec.add_node(node);
+  exec.spin();
   rclcpp::shutdown();
   return 0;
 }
