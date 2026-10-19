@@ -25,6 +25,7 @@ ament_target_dependencies(lrs_mission_node
   rclcpp geometry_msgs mavros_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs)
 
 install(TARGETS lrs_mission_node DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/plot_bag.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
 # Map and mission files live at the repository root; ship them with the package.
 install(DIRECTORY ../maps ../missions DESTINATION share/${PROJECT_NAME})
