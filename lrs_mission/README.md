@@ -64,13 +64,14 @@ local ENU. Outdoors, `map` is the MAVROS local ENU frame.
 
 Parameters: [config/indoor.yaml](config/indoor.yaml), [config/outdoor.yaml](config/outdoor.yaml).
 
-## Recordings and figures
+## Recordings, figures and documentation
 
 | Path | What |
 |---|---|
 | [`../bags/indoor_run1`](../bags/indoor_run1) | rosbag of a complete indoor mission (`exam_example.csv`, 191 s, ends in `DONE`) |
 | [`../bags/outdoor_run1`](../bags/outdoor_run1) | rosbag of a complete outdoor mission (103 s, ends in `DONE`) |
 | [`../docs/figures`](../docs/figures) | flown vs. commanded track, altitude and yaw, generated from the bags |
+| [`../docs/LRS_dokumentacia.pdf`](../docs/LRS_dokumentacia.pdf) | A1.4 documentation (Slovak, PDF) |
 
 ```bash
 # replay a mission (start RViz with rviz/lrs_mission.rviz to watch it)
@@ -107,9 +108,10 @@ callback cannot delay the 20 Hz control loop:
 | `cb_sensors_` (MutuallyExclusive) | every subscription: state, pose, velocity, GPS, compass, home, `~/query` |
 | default group | `viz_timer_` (2 Hz, `~/flown_path`), `status_timer_` (1 Hz, outdoor status print) |
 
-The state machine needs no lock: `tick()`, the service replies and `~/abort` share one
-MutuallyExclusive group, so the executor never runs two of them at once. `mtx_` guards only the
-data one group writes and another reads (sensor snapshot, flown track, `phase_`). Slow work, such as
+`tick()` runs under `mtx_` because it reads the sensor snapshot. The state-machine variables
+(`idx_`, `step_`, `pending_`) need no lock: `tick()`, the service replies and `~/abort` share one
+MutuallyExclusive group, so the executor never runs two of them at once. `mtx_` guards the data one
+group writes and another reads (sensor snapshot, flown track, `phase_`). Slow work, such as
 serialising the flown path, is done on a copy outside the lock.
 
 ### Frames and angles

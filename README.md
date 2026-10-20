@@ -10,6 +10,7 @@ mission, dependencies and results.
 | Missions | [`missions/exam_example.csv`](missions/exam_example.csv) |
 | Recordings | [`bags/indoor_run1`](bags/indoor_run1), [`bags/outdoor_run1`](bags/outdoor_run1) |
 | Figures | [`docs/figures/`](docs/figures/) |
+| Documentation (A1.4) | [`docs/LRS_dokumentacia.pdf`](docs/LRS_dokumentacia.pdf) |
 
 Everything below is the original course repository README (simulation setup).
 
