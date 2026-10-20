@@ -11,11 +11,13 @@ Assignment 1 in one ROS 2 node ([src/lrs_mission_node.cpp](src/lrs_mission_node.
 ## Build
 
 ```bash
-cd ~/ros2_ws/src && ln -s ~/LRS-URK/lrs_mission .
+cd ~/ros2_ws/src && ln -s ~/LRS_Maco_Supak/lrs_mission .   # path to your clone of this repository
 cd ~/ros2_ws && colcon build --packages-select lrs_mission && source install/setup.bash
 ```
 
 Dependencies: ROS 2 Jazzy, MAVROS, PCL (`sudo apt install libpcl-dev`).
+`scripts/plot_bag.py` additionally needs `rosbag2_py` (part of ROS 2) and
+`sudo apt install python3-matplotlib python3-numpy python3-yaml`.
 
 ## Run
 
@@ -23,11 +25,11 @@ Start the simulation in three terminals as in the [repository README](../README.
 `scripts/run_gazebo.sh <world>`, `scripts/run_sitl.sh`, `scripts/run_mavros.sh`.
 
 ```bash
-# Indoor (world fei_lrs_gazebo.world)
+# Indoor: scripts/run_gazebo.sh fei_lrs_gazebo.world
 ros2 launch lrs_mission indoor.launch.py                                   # missions/exam_example.csv
 ros2 launch lrs_mission indoor.launch.py mission_file:=/path/to/mission.csv
 
-# Outdoor (world fei_lrs_outdoor.world)
+# Outdoor: scripts/run_gazebo.sh fei_lrs_outdoor.world
 ros2 launch lrs_mission outdoor.launch.py
 
 # Abort: switch to LAND and stop sending setpoints
@@ -62,7 +64,53 @@ local ENU. Outdoors, `map` is the MAVROS local ENU frame.
 
 Parameters: [config/indoor.yaml](config/indoor.yaml), [config/outdoor.yaml](config/outdoor.yaml).
 
+## Recordings and figures
+
+| Path | What |
+|---|---|
+| [`../bags/indoor_run1`](../bags/indoor_run1) | rosbag of a complete indoor mission (`exam_example.csv`, 191 s, ends in `DONE`) |
+| [`../bags/outdoor_run1`](../bags/outdoor_run1) | rosbag of a complete outdoor mission (103 s, ends in `DONE`) |
+| [`../docs/figures`](../docs/figures) | flown vs. commanded track, altitude and yaw, generated from the bags |
+
+```bash
+# replay a mission (start RViz with rviz/lrs_mission.rviz to watch it)
+ros2 bag play bags/indoor_run1
+
+# figures + numbers from a bag (run from the repository root)
+ros2 run lrs_mission plot_bag.py bags/indoor_run1  --mission indoor  --out docs/figures/indoor
+ros2 run lrs_mission plot_bag.py bags/outdoor_run1 --mission outdoor --out docs/figures/outdoor
+```
+
+`plot_bag.py` prints the metrics used in the documentation (yaw tracking, nose vs. direction of
+travel, nose vs. POI bearing, path / figure-8 deviation) and saves three PNGs per mission. To record
+a new run:
+
+```bash
+ros2 bag record -o indoor_run2 \
+  /mavros/local_position/pose /mavros/local_position/velocity_local \
+  /mavros/setpoint_raw/local /lrs_mission/path /lrs_mission/flown_path \
+  /lrs_mission/waypoints /rosout
+```
+
+Outdoors add `/mavros/global_position/global /mavros/global_position/compass_hdg /mavros/home_position/home`.
+
 ## How it works
+
+### Threads and callback groups
+
+The node runs on a `MultiThreadedExecutor` with 4 threads and three callback groups, so a slow
+callback cannot delay the 20 Hz control loop:
+
+| Group | Callbacks |
+|---|---|
+| `cb_control_` (MutuallyExclusive) | `tick()` at 20 Hz (state machine + setpoint), MAVROS service replies, `~/abort` |
+| `cb_sensors_` (MutuallyExclusive) | every subscription: state, pose, velocity, GPS, compass, home, `~/query` |
+| default group | `viz_timer_` (2 Hz, `~/flown_path`), `status_timer_` (1 Hz, outdoor status print) |
+
+The state machine needs no lock: `tick()`, the service replies and `~/abort` share one
+MutuallyExclusive group, so the executor never runs two of them at once. `mtx_` guards only the
+data one group writes and another reads (sensor snapshot, flown track, `phase_`). Slow work, such as
+serialising the flown path, is done on a copy outside the lock.
 
 ### Frames and angles
 
@@ -94,21 +142,25 @@ Parameters: [config/indoor.yaml](config/indoor.yaml), [config/outdoor.yaml](conf
   point reachable in a straight line that is collision-free (sampled every half voxel against the
   inflated grid). Every simplified segment is checked again.
 
-`missions/exam_example.csv`, 0.1 m voxels, 0.5 m radius:
+`missions/exam_example.csv`, 0.1 m voxels, 0.5 m radius (from the log in `bags/indoor_run1`; the
+times vary by a few ms between runs):
 
-| Segment | A\* time | Points before → after |
-|---|---|---|
-| 1 → 2 | 9 ms | 50 → 2 |
-| 2 → 3 | 6 ms | 45 → 4 |
-| 3 → 4 (over the rack) | 20 ms | 69 → 9 |
-| 4 → 5 | 9 ms | 69 → 3 |
-| 5 → 6 | 3 ms | 61 → 4 |
-| 6 → 7 | 12 ms | 114 → 4 |
+| Segment | A\* time | Points before → after | Collision check |
+|---|---|---|---|
+| 1 → 2 | 5 ms | 50 → 2 | OK |
+| 2 → 3 | 3 ms | 45 → 4 | OK |
+| 3 → 4 (over the rack) | 13 ms | 69 → 9 | OK |
+| 4 → 5 | 7 ms | 69 → 3 | OK |
+| 5 → 6 | 3 ms | 61 → 4 | OK |
+| 6 → 7 | 8 ms | 114 → 4 | OK |
 
 ### A1.2 Indoor mission
 
 States are logged as `[state] ...`:
-`WAIT_FOR_FCU → TAKEOFF → NAVIGATE → TASK_YAW → LAND → TAKEOFF → … → LAND → DONE`.
+`IDLE → SET_MODE → ARM → TAKEOFF → CLIMB → NAVIGATE → TASK_YAW → … → LAND → DESCEND → ON_GROUND →
+SET_MODE → ARM → TAKEOFF → … → LAND → DESCEND → ON_GROUND → DONE`.
+If the mode is changed by someone else (e.g. from the RC transmitter) or MAVROS disconnects, the
+node stops publishing setpoints.
 Every service response is checked, and failed calls are retried every second.
 
 - **Mission:** all segments are planned at startup, then turned into a list of actions in the local frame.
@@ -143,10 +195,14 @@ Every service response is checked, and failed calls are retried every second.
 - **Abort:** `~/abort` switches to LAND. If MAVROS disconnects or someone else changes the mode
   (e.g. the RC safety pilot), the node stops publishing setpoints and does not fight back.
 
-### Results in SITL (headless gz + ArduPilot SITL + MAVROS)
+### Results in SITL
+
+Measured from the recordings in [`../bags`](../bags) with `plot_bag.py`. Angular errors are given
+as median and 95th percentile; the maximum is dominated by the step at a `yaw` task.
 
 | | |
 |---|---|
-| Indoor `exam_example.csv` | unattended, ~3 min. Hard waypoints settle within 0.05–0.12 m. Minimum clearance to walls/racks 0.32 m (crossing over the rack). Speed ≤ 1.2 m/s. Heading vs. travel direction: median 2.8° |
-| Outdoor square | yaw vs. bearing to POI: median 1.4°, max 5.8° |
-| Outdoor figure-8 | flown track within 0.05 m of the ideal curve (±3.02 × ±1.49 m). Yaw vs. commanded tangent: median 0.9° |
+| Indoor `exam_example.csv` | unattended, 191 s, ends in `DONE`. Hard waypoints settle within 0.06–0.08 m. Flown vs. planned path: max 0.08 m. Over the rack at 4.66 m (rack top 4.10 m). Speed ≤ 1.08 m/s horizontal. Heading vs. travel direction: median 0.7°, p95 14.7° |
+| Outdoor square | yaw vs. bearing to POI: median 3.1°, p95 8.9° |
+| Outdoor figure-8 | flown track within 0.041 m of the commanded curve, lap 20.9 s (predicted 21 s). Yaw vs. commanded yaw (whole outdoor flight): median 1.0°, p95 5.9° |
+| Outdoor speed | ≤ 1.55 m/s horizontal; 2.16 m/s vertical during the takeoff climb (ArduPilot's own takeoff) |

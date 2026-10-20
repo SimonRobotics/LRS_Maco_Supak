@@ -1,3 +1,20 @@
+# LRS – Assignment 1: Šimon Maco, Boris Šupák
+
+Our solution is the ROS 2 package [`lrs_mission/`](lrs_mission/). Its
+[README](lrs_mission/README.md) covers build, launch of the indoor and outdoor
+mission, dependencies and results.
+
+| | |
+|---|---|
+| Package | [`lrs_mission/`](lrs_mission/) |
+| Missions | [`missions/exam_example.csv`](missions/exam_example.csv) |
+| Recordings | [`bags/indoor_run1`](bags/indoor_run1), [`bags/outdoor_run1`](bags/outdoor_run1) |
+| Figures | [`docs/figures/`](docs/figures/) |
+
+Everything below is the original course repository README (simulation setup).
+
+---
+
 # LRS-URK
 
 Gazebo Sim (`gz sim`) worlds, models, and a ROS 2 example, migrated from the
