@@ -1,0 +1,20 @@
+lrs_localization:
+  ros__parameters:
+    use_sim_time: true
+
+    # --- inputs: the only topics the estimator may subscribe to
+    gps_topic: /localization/gps
+    vo_topic: /localization/vo
+    imu_topic: /localization/imu
+
+    # --- frames from the sensor contract; a message with other frames is ignored
+    gps_frame: map
+    vo_frame: vo_odom          # VO pose
+    vo_child_frame: base_link  # VO twist is body-frame velocity
+    imu_frame: base_link
+
+    # --- timestamps
+    reset_jump_s: 1.0          # a stamp this far in the past = simulation reset, not a late sample
+
+    # --- logging
+    report_period_s: 5.0       # [s] period of the "[sensors] ..." rate summary

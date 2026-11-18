@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lrs_localization</name>
+  <version>0.1.0</version>
+  <description>Assignment 2: eight-state Kalman filter fusing GPS, visual odometry and a yaw gyro</description>
+  <maintainer email="simon.maco@mjolnirindustries.eu">SimonRobotics</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>localization_sensor_sim</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
