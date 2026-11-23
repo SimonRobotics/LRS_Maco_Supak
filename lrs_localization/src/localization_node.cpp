@@ -13,8 +13,13 @@
 // of each sensor.
 //
 // §2 Filter (ekf.hpp): the IMU drives the prediction -- every gyro sample propagates the state
-// to its own header stamp and the estimate is published. A GPS fix first predicts the state
-// forward to the fix's stamp, then corrects it. Nothing waits for the sensors to line up.
+// to its own header stamp and the estimate is published. A GPS fix or a VO sample first
+// predicts the state forward to its stamp, then corrects it. Nothing waits for the sensors to
+// line up. Updates:
+//   GPS position                      linear, R from the message
+//   VO body velocity (10 Hz)          EKF, h = Rz(-yaw) v -- couples yaw, heading from motion
+//   zero-rate / zero-velocity (1 Hz)  only while standing still: b = mean gyro, v = 0
+//   VO yaw                            off by default (it drifts); vo_yaw_mode absolute to compare
 //
 // Threading: all callbacks share the filter state, so they must run one at a time. The node
 // is spun by a SingleThreadedExecutor, which guarantees that without any locks.
@@ -101,14 +106,33 @@ public:
     q_ = q;
     ekf_.setProcessNoise(q_);
     init_vel_std_ = declare_parameter("init_vel_std", 1.0);
-    init_yaw_std_ = declare_parameter("init_yaw_std", 0.1);
+    init_yaw_source_ = declare_parameter("init_yaw_source", std::string("spawn"));  // spawn | vo
+    if (init_yaw_source_ != "spawn" && init_yaw_source_ != "vo") {
+      throw std::runtime_error("init_yaw_source must be spawn or vo");
+    }
+    initial_yaw_ = declare_parameter("initial_yaw_deg", 90.0) * M_PI / 180.0;
+    init_yaw_std_ = declare_parameter("init_yaw_std", 0.05);
     init_bias_std_ = declare_parameter("init_bias_std", 0.05);
     gps_std_fallback_ = declare_parameter("gps_std_fallback", std::vector<double>{0.6, 0.6, 0.9});
     if (gps_std_fallback_.size() != 3) {throw std::runtime_error("gps_std_fallback needs 3 values");}
     max_lag_ = declare_parameter("max_meas_lag_s", 0.1);
+    vo_vel_std_ = declare_parameter("vo_vel_std", 0.1);  // <= 0: covariance from the message
+    vo_vel_period_ = declare_parameter("vo_vel_period_s", 0.1);
+    vo_yaw_mode_ = declare_parameter("vo_yaw_mode", std::string("off"));  // off | absolute
+    if (vo_yaw_mode_ != "off" && vo_yaw_mode_ != "absolute") {
+      throw std::runtime_error("vo_yaw_mode must be off or absolute");
+    }
     const double vo_yaw_std = declare_parameter("vo_yaw_std_deg", 3.0) * M_PI / 180.0;
     vo_yaw_var_ = vo_yaw_std * vo_yaw_std;
     vo_yaw_period_ = declare_parameter("vo_yaw_period_s", 1.0);
+    zaru_enabled_ = declare_parameter("zaru_enabled", true);
+    zaru_window_ = declare_parameter("zaru_window_s", 1.0);
+    zaru_max_speed_ = declare_parameter("zaru_max_speed", 0.1);
+    zaru_max_rate_ = declare_parameter("zaru_max_rate", 0.05);
+    zaru_max_rate_std_ = declare_parameter("zaru_max_rate_std", 0.02);
+    zaru_slack_ = declare_parameter("zaru_slack", 0.001);
+    zupt_enabled_ = declare_parameter("zupt_enabled", true);
+    zupt_std_ = declare_parameter("zupt_std", 0.02);
 
     odom_frame_ = declare_parameter("odom_frame", std::string("map"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
@@ -153,7 +177,52 @@ private:
     ++imu_wz_n_;
     last_wz_ = m.angular_velocity.z;
     gyro_var_ = m.angular_velocity_covariance[8] > 0.0 ? m.angular_velocity_covariance[8] : gyro_var_;
-    if (ekf_.initialized() && ekf_.predictTo(t, last_wz_)) {publish();}
+    if (!ekf_.initialized()) {return;}
+    if (ekf_.predictTo(t, last_wz_)) {publish();}
+    zeroRateWindow(t, last_wz_);
+  }
+
+  // Zero-rate update (ZARU). Over each window of zaru_window_s the node collects the gyro rate
+  // and the VO body velocity. If the drone stood still for the whole window -- VO speed small,
+  // gyro mean close to the bias estimate and no oscillation -- its true yaw rate was zero, so
+  // the mean gyro rate is a direct measurement of the bias: z = mean(w), H = e_b,
+  // R = gyro_var / N + zaru_slack^2. This estimates the bias from the gyro itself, not from the
+  // drifting VO heading, and keeps the yaw from walking away while the drone waits.
+  void zeroRateWindow(double t, double w)
+  {
+    if (zaru_n_ == 0) {zaru_t0_ = t;}
+    zaru_sum_ += w;
+    zaru_sumsq_ += w * w;
+    ++zaru_n_;
+    if (t - zaru_t0_ < zaru_window_) {return;}
+
+    const double mean = zaru_sum_ / static_cast<double>(zaru_n_);
+    const double std = std::sqrt(std::max(0.0, zaru_sumsq_ / static_cast<double>(zaru_n_) - mean * mean));
+    const double speed = zaru_vo_n_ ? (zaru_vo_sum_ / static_cast<double>(zaru_vo_n_)).norm() : 1e9;
+    const bool still = zaru_vo_n_ >= 5 && speed < zaru_max_speed_ &&
+      std::abs(mean - ekf_.x()(idx::kBias)) < zaru_max_rate_ && std < zaru_max_rate_std_;
+    if (still != stationary_) {
+      stationary_ = still;
+      RCLCPP_INFO(
+        get_logger(), "[zaru] %s (VO speed %.3f m/s, gyro mean %+.4f std %.4f rad/s)",
+        still ? "standing still: zero-rate bias updates ON" : "moving or turning: zero-rate updates OFF",
+        speed, mean, std);
+    }
+    if (still && zaru_enabled_) {
+      const auto res = ekf_.updateBias(mean, gyro_var_ / static_cast<double>(zaru_n_) + zaru_slack_ * zaru_slack_);
+      if (res.applied) {zaru_nis_sum_ += res.nis; ++zaru_nis_n_;}
+    }
+    // Zero-velocity update (ZUPT), same detection: standing still means v = 0. Without it the
+    // slowly wandering VO velocity bias makes the filter believe the drone creeps (z off by
+    // 0.4 m after minutes on the ground, far outside its 2 sigma).
+    if (still && zupt_enabled_) {
+      const auto res = ekf_.updateVelocity(Eigen::Vector3d::Zero(), Eigen::Matrix3d::Identity() * zupt_std_ * zupt_std_);
+      if (res.applied) {zupt_nis_sum_ += res.nis; ++zupt_nis_n_;}
+    }
+    zaru_n_ = 0;
+    zaru_sum_ = zaru_sumsq_ = 0.0;
+    zaru_vo_sum_.setZero();
+    zaru_vo_n_ = 0;
   }
 
   void onGps(const geometry_msgs::msg::PoseWithCovarianceStamped & m)
@@ -178,42 +247,70 @@ private:
     ++gps_nis_n_;
   }
 
-  // VO yaw: initial heading, then the heading measurement. GPS has no orientation, so VO is
-  // the only heading sensor. Its errors are dominated by a slow drift (~3 deg/min measured),
-  // i.e. strongly correlated in time: fusing all 30 Hz samples as independent would make the
-  // filter far more certain of yaw than it is. One sample per vo_yaw_period_s with a sigma
-  // that covers the drift over a mission (vo_yaw_std_deg) matches the real information.
+  // VO: the linear twist (velocity in base_link) is fused with the EKF body-velocity update.
+  // The VO pose is not used -- it drifts without bound (characterisation: 0.8 m/min at rest,
+  // yaw 113 deg off after an hour) and its covariance (1 cm) does not say so.
+  // vo_yaw_mode "absolute" re-enables the step-4 heading update from VO yaw, for comparison.
   void onVo(const nav_msgs::msg::Odometry & m)
   {
     const double t = toSec(m.header.stamp);
     if (!accept(vo_, t, m.header.frame_id, m.child_frame_id)) {return;}
     vo_yaw_ = quatYaw(m.pose.pose.orientation);
     have_vo_yaw_ = true;
-    if (!ekf_.initialized() || t - last_vo_yaw_t_ < vo_yaw_period_) {return;}
-    if (!bringTo(vo_, t)) {return;}
-    const auto res = ekf_.updateYaw(vo_yaw_, vo_yaw_var_);
-    if (!res.applied) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[vo] yaw update produced non-finite values, skipped");
-      return;
+    const auto & l = m.twist.twist.linear;
+    const Eigen::Vector3d vb(l.x, l.y, l.z);
+    zaru_vo_sum_ += vb;
+    ++zaru_vo_n_;
+    if (!ekf_.initialized()) {return;}
+
+    if (t - last_vo_vel_t_ >= vo_vel_period_ && bringTo(vo_, t)) {
+      const auto res = ekf_.updateBodyVelocity(vb, voVelocityCovariance(m));
+      if (res.applied) {
+        last_vo_vel_t_ = t;
+        vo_vel_nis_sum_ += res.nis;
+        ++vo_vel_nis_n_;
+      } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[vo] velocity update produced non-finite values, skipped");
+      }
     }
-    last_vo_yaw_t_ = t;
-    vo_yaw_nis_sum_ += res.nis;
-    ++vo_yaw_nis_n_;
+
+    if (vo_yaw_mode_ == "absolute" && t - last_vo_yaw_t_ >= vo_yaw_period_ && bringTo(vo_, t)) {
+      const auto res = ekf_.updateYaw(vo_yaw_, vo_yaw_var_);
+      if (res.applied) {
+        last_vo_yaw_t_ = t;
+        vo_yaw_nis_sum_ += res.nis;
+        ++vo_yaw_nis_n_;
+      }
+    }
+  }
+
+  // VO velocity noise: vo_vel_std if set, otherwise the message's twist covariance.
+  Eigen::Matrix3d voVelocityCovariance(const nav_msgs::msg::Odometry & m) const
+  {
+    if (vo_vel_std_ > 0.0) {return Eigen::Matrix3d::Identity() * vo_vel_std_ * vo_vel_std_;}
+    Eigen::Matrix3d R;
+    for (int r = 0; r < 3; ++r) {
+      for (int c = 0; c < 3; ++c) {R(r, c) = m.twist.covariance[r * 6 + c];}
+    }
+    if (R.allFinite() && R.diagonal().minCoeff() > 0.0) {return 0.5 * (R + R.transpose());}
+    return Eigen::Matrix3d::Identity() * 0.03 * 0.03;
   }
 
   // ------------------------------------------------------------ filter helpers
 
-  // Position from the first GPS fix (its own covariance), heading from VO -- the VO frame
-  // starts aligned with the true pose. Velocity and gyro bias start at zero with a wide sigma.
+  // Position from the first GPS fix (its own covariance). Heading: the known spawn yaw
+  // (init_yaw_source "spawn", the assignment's initial ENU yaw pi/2) -- or the current VO yaw
+  // ("vo"), which is right only if VO started recently, since it drifts. Velocity and gyro
+  // bias start at zero with a wide sigma.
   void initialize(double t, const Eigen::Vector3d & z, const Eigen::Matrix3d & R)
   {
-    if (!have_vo_yaw_) {
+    if (init_yaw_source_ == "vo" && !have_vo_yaw_) {
       RCLCPP_INFO_ONCE(get_logger(), "[filter] GPS ready, waiting for VO heading to initialise");
       return;
     }
     StateVec x0 = StateVec::Zero();
     x0.segment<3>(idx::kPx) = z;
-    x0(idx::kYaw) = vo_yaw_;
+    x0(idx::kYaw) = init_yaw_source_ == "vo" ? vo_yaw_ : initial_yaw_;
     StateCov P0 = StateCov::Zero();
     P0.block<3, 3>(idx::kPx, idx::kPx) = R;
     P0.block<3, 3>(idx::kVx, idx::kVx) = Eigen::Matrix3d::Identity() * init_vel_std_ * init_vel_std_;
@@ -221,8 +318,8 @@ private:
     P0(idx::kBias, idx::kBias) = init_bias_std_ * init_bias_std_;
     ekf_.initialize(x0, P0, t);
     RCLCPP_INFO(
-      get_logger(), "[filter] initialised at t=%.3f s: p=(%.2f, %.2f, %.2f) yaw=%.1f deg",
-      t, z.x(), z.y(), z.z(), x0(idx::kYaw) * 180.0 / M_PI);
+      get_logger(), "[filter] initialised at t=%.3f s: p=(%.2f, %.2f, %.2f) yaw=%.1f deg (%s)",
+      t, z.x(), z.y(), z.z(), x0(idx::kYaw) * 180.0 / M_PI, init_yaw_source_.c_str());
     publish();
   }
 
@@ -340,7 +437,11 @@ private:
         ekf_ = Ekf8();
         ekf_.setProcessNoise(q_);
         have_vo_yaw_ = false;
-        last_vo_yaw_t_ = -1e9;
+        last_vo_yaw_t_ = last_vo_vel_t_ = -1e9;
+        zaru_n_ = zaru_vo_n_ = 0;
+        zaru_sum_ = zaru_sumsq_ = 0.0;
+        zaru_vo_sum_.setZero();
+        stationary_ = false;
         return true;
       default:
         RCLCPP_WARN_THROTTLE(
@@ -386,17 +487,21 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "[filter] t=%.1f p=(%.2f, %.2f, %.2f) v=(%.2f, %.2f, %.2f) yaw=%.1f deg b=%+.4f rad/s | "
-      "sigma xy %.2f m, z %.2f m, yaw %.1f deg, b %.4f | updates (mean NIS, expect dim): "
-      "GPS %zu (%.2f/3), VO yaw %zu (%.2f/1)",
+      "sigma xy %.2f m, z %.2f m, yaw %.1f deg, b %.4f | %s | updates (mean NIS / expected): "
+      "GPS %zu (%.2f/3), VO vel %zu (%.2f/3), ZARU %zu (%.2f/1), ZUPT %zu (%.2f/3), VO yaw %zu (%.2f/1)",
       ekf_.time(), x(idx::kPx), x(idx::kPy), x(idx::kPz), x(idx::kVx), x(idx::kVy), x(idx::kVz),
       x(idx::kYaw) * 180.0 / M_PI, x(idx::kBias),
       std::sqrt(0.5 * (P(idx::kPx, idx::kPx) + P(idx::kPy, idx::kPy))), std::sqrt(P(idx::kPz, idx::kPz)),
       std::sqrt(P(idx::kYaw, idx::kYaw)) * 180.0 / M_PI, std::sqrt(P(idx::kBias, idx::kBias)),
-      gps_nis_n_, gps_nis_n_ ? gps_nis_sum_ / gps_nis_n_ : 0.0,
-      vo_yaw_nis_n_, vo_yaw_nis_n_ ? vo_yaw_nis_sum_ / vo_yaw_nis_n_ : 0.0);
-    gps_nis_sum_ = vo_yaw_nis_sum_ = 0.0;
-    gps_nis_n_ = vo_yaw_nis_n_ = 0;
+      stationary_ ? "still" : "moving",
+      gps_nis_n_, mean(gps_nis_sum_, gps_nis_n_), vo_vel_nis_n_, mean(vo_vel_nis_sum_, vo_vel_nis_n_),
+      zaru_nis_n_, mean(zaru_nis_sum_, zaru_nis_n_), zupt_nis_n_, mean(zupt_nis_sum_, zupt_nis_n_),
+      vo_yaw_nis_n_, mean(vo_yaw_nis_sum_, vo_yaw_nis_n_));
+    gps_nis_sum_ = vo_vel_nis_sum_ = zaru_nis_sum_ = zupt_nis_sum_ = vo_yaw_nis_sum_ = 0.0;
+    gps_nis_n_ = vo_vel_nis_n_ = zaru_nis_n_ = zupt_nis_n_ = vo_yaw_nis_n_ = 0;
   }
+
+  static double mean(double sum, std::size_t n) {return n ? sum / static_cast<double>(n) : 0.0;}
 
   SensorChannel gps_, vo_, imu_;
   double imu_wz_sum_{0.0};
@@ -409,14 +514,34 @@ private:
   double gyro_var_{1.6e-5};
   double vo_yaw_{0.0};
   bool have_vo_yaw_{false};
-  double init_vel_std_, init_yaw_std_, init_bias_std_, max_lag_;
+  double init_vel_std_, init_yaw_std_, init_bias_std_, max_lag_, initial_yaw_;
+  std::string init_yaw_source_;
   std::vector<double> gps_std_fallback_;
   std::size_t late_dropped_{0};
   double gps_nis_sum_{0.0};
   std::size_t gps_nis_n_{0};
+  // VO velocity
+  double vo_vel_std_{0.0}, vo_vel_period_{0.0}, last_vo_vel_t_{-1e9};
+  double vo_vel_nis_sum_{0.0};
+  std::size_t vo_vel_nis_n_{0};
+  // VO yaw (only with vo_yaw_mode absolute)
+  std::string vo_yaw_mode_;
   double vo_yaw_var_{0.0}, vo_yaw_period_{1.0}, last_vo_yaw_t_{-1e9};
   double vo_yaw_nis_sum_{0.0};
   std::size_t vo_yaw_nis_n_{0};
+  // zero-rate update
+  bool zaru_enabled_{true}, stationary_{false};
+  double zaru_window_{1.0}, zaru_max_speed_{0.1}, zaru_max_rate_{0.05}, zaru_max_rate_std_{0.02}, zaru_slack_{0.001};
+  double zaru_t0_{0.0}, zaru_sum_{0.0}, zaru_sumsq_{0.0};
+  std::size_t zaru_n_{0};
+  Eigen::Vector3d zaru_vo_sum_{Eigen::Vector3d::Zero()};
+  std::size_t zaru_vo_n_{0};
+  double zaru_nis_sum_{0.0};
+  std::size_t zaru_nis_n_{0};
+  bool zupt_enabled_{true};
+  double zupt_std_{0.05};
+  double zupt_nis_sum_{0.0};
+  std::size_t zupt_nis_n_{0};
   std::string odom_frame_, base_frame_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gps_sub_;

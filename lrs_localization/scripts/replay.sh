@@ -30,7 +30,7 @@ REC_PID=$!
 trap 'kill -TERM $NODE_PID $REC_PID 2>/dev/null' EXIT
 sleep 2
 
-ros2 bag play "$IN" --clock 100 --rate "$RATE" >/dev/null
+ros2 bag play "$IN" --clock 100 --rate "$RATE" ${PLAY_ARGS:-} >/dev/null  # PLAY_ARGS e.g. "--start-offset 470"
 sleep 1
 kill -TERM $REC_PID; wait $REC_PID 2>/dev/null || true
 kill -TERM $NODE_PID; wait $NODE_PID 2>/dev/null || true

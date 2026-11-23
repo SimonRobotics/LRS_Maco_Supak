@@ -15,7 +15,8 @@
 //   P   <- F P F^T + Q(dt)
 // The model is linear in x, so F is exact: identity plus dt in (p, v) and -dt in (yaw, b).
 //
-// Measurement update, z = h(x) + noise with covariance R:
+// Measurement update, z = h(x) + noise with covariance R (H = dh/dx; for the linear GPS, yaw
+// and bias updates H is constant, for the body-velocity update it is the EKF Jacobian):
 //   r = z - h(x)            innovation, angle rows wrapped
 //   S = H P H^T + R         its expected covariance
 //   K = P H^T S^-1          computed by solving with S, never by inverting it
@@ -54,7 +55,7 @@ struct ProcessNoise
 {
   double acc_xy{0.5};   // horizontal acceleration [m^2/s^3]
   double acc_z{0.2};    // vertical acceleration [m^2/s^3]
-  double yaw{2e-3};     // yaw random walk [rad^2/s]: gyro noise + unobserved VO heading drift
+  double yaw{1e-5};     // yaw random walk [rad^2/s]: gyro noise with margin
   double bias{1e-8};    // gyro bias random walk [rad^2/s^3]
 };
 
@@ -172,6 +173,59 @@ public:
     Eigen::Matrix<double, 3, kNx> H = Eigen::Matrix<double, 3, kNx>::Zero();
     H.block<3, 3>(0, kPx) = Eigen::Matrix3d::Identity();
     return update<3>(z, x_.segment<3>(kPx), H, R);
+  }
+
+  // VO linear twist = velocity in the body frame: z = Rz(-yaw) v, nonlinear in (v, yaw).
+  //   h(x) = [ c vx + s vy,  -s vx + c vy,  vz ]        c = cos(yaw), s = sin(yaw)
+  //   H = dh/dx:  row 1: d/dvx = c,  d/dvy = s,  d/dyaw = -s vx + c vy
+  //               row 2: d/dvx = -s, d/dvy = c,  d/dyaw = -c vx - s vy
+  //               row 3: d/dvz = 1
+  // The yaw column is what makes the heading observable from motion: GPS fixes the velocity
+  // in ENU, VO measures the same velocity in the body frame, and the rotation between the two
+  // is the yaw. When the drone does not move, that column is zero -- no heading information.
+  UpdateResult<3> updateBodyVelocity(const Eigen::Vector3d & z, const Eigen::Matrix3d & R)
+  {
+    return update<3>(z, bodyVelocity(x_), bodyVelocityJacobian(x_), R);
+  }
+
+  static Eigen::Vector3d bodyVelocity(const StateVec & x)
+  {
+    const double c = std::cos(x(kYaw)), s = std::sin(x(kYaw));
+    return {c * x(kVx) + s * x(kVy), -s * x(kVx) + c * x(kVy), x(kVz)};
+  }
+
+  static Eigen::Matrix<double, 3, kNx> bodyVelocityJacobian(const StateVec & x)
+  {
+    const double c = std::cos(x(kYaw)), s = std::sin(x(kYaw));
+    Eigen::Matrix<double, 3, kNx> H = Eigen::Matrix<double, 3, kNx>::Zero();
+    H(0, kVx) = c;
+    H(0, kVy) = s;
+    H(0, kYaw) = -s * x(kVx) + c * x(kVy);
+    H(1, kVx) = -s;
+    H(1, kVy) = c;
+    H(1, kYaw) = -c * x(kVx) - s * x(kVy);
+    H(2, kVz) = 1.0;
+    return H;
+  }
+
+  // ENU velocity directly: z = v, H = [0 I3 0 0], linear. Used as a zero-velocity update --
+  // while the drone stands still its true velocity is 0, which also cancels the VO velocity bias.
+  UpdateResult<3> updateVelocity(const Eigen::Vector3d & z, const Eigen::Matrix3d & R)
+  {
+    Eigen::Matrix<double, 3, kNx> H = Eigen::Matrix<double, 3, kNx>::Zero();
+    H.block<3, 3>(0, kVx) = Eigen::Matrix3d::Identity();
+    return update<3>(z, x_.segment<3>(kVx), H, R);
+  }
+
+  // Gyro bias directly: z = b, H = e_b. Used as a zero-rate update -- while the drone stands
+  // still its true yaw rate is 0, so the mean gyro reading over a window IS the bias.
+  UpdateResult<1> updateBias(double z, double var)
+  {
+    Eigen::Matrix<double, 1, kNx> H = Eigen::Matrix<double, 1, kNx>::Zero();
+    H(0, kBias) = 1.0;
+    return update<1>(
+      Eigen::Matrix<double, 1, 1>(z), Eigen::Matrix<double, 1, 1>(x_(kBias)), H,
+      Eigen::Matrix<double, 1, 1>(var));
   }
 
   // Heading (VO yaw): z = yaw, H = e_yaw, linear; the innovation is wrapped, so a measurement

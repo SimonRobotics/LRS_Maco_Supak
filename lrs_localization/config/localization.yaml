@@ -26,23 +26,40 @@ lrs_localization:
     # --- process noise Q: continuous densities, discretised in ekf.hpp
     q_acc_xy: 0.25             # [m^2/s^3] horizontal acceleration (~0.5 m/s^2 over ~1 s turns)
     q_acc_z: 0.1               # [m^2/s^3] vertical acceleration
-    q_yaw: 2.0e-3              # [rad^2/s] yaw random walk. NOT just the gyro noise (0.004^2 * 0.01 s = 1.6e-7):
-                               #   it also covers the drift of the VO heading, the only yaw measurement, which
-                               #   nothing observes. With 1.6e-7 the filter claims 0.8 deg while the real error
-                               #   reaches 6 deg (31 % inside 2 sigma); with 2e-3: 94 %. See README §2 tuning.
-    q_bias: 1.0e-8             # [rad^2/s^3] gyro bias random walk (bias is static, keep it small)
+    q_yaw: 1.0e-5              # [rad^2/s] yaw random walk: gyro noise (0.004^2 * 0.01 s = 1.6e-7) with margin.
+                               #   (Step 4 needed 2e-3 to cover the drifting VO heading; that is no longer fused.)
+    q_bias: 1.0e-8             # [rad^2/s^3] gyro bias random walk (Gazebo's bias is static)
 
-    # --- initial covariance P0 (1 sigma); position uses the first GPS fix's covariance
+    # --- initialisation and initial covariance P0 (1 sigma); position = first GPS fix with its covariance
+    init_yaw_source: spawn     # spawn: initial_yaw_deg (the assignment's start yaw) | vo: current VO yaw,
+                               #   right only if VO started recently -- it drifts (113 deg after an hour)
+    initial_yaw_deg: 90.0      # [deg] ENU yaw at the spawn point: Gazebo yaw 0 + 90 deg
+    init_yaw_std: 0.05         # [rad]
     init_vel_std: 1.0          # [m/s]
-    init_yaw_std: 0.1          # [rad] heading taken from VO, which starts aligned with the truth
     init_bias_std: 0.05        # [rad/s] bias magnitude is ~0.02, either sign
 
     # --- measurement noise R
     gps_std_fallback: [0.6, 0.6, 0.9]  # [m] used only if the GPS message has no valid covariance
-    vo_yaw_std_deg: 3.0        # [deg] VO heading: covers its drift over a mission (~3 deg/min measured),
-                               #       not its 0.3 deg sample noise -- the drift is what the filter must not trust
-    vo_yaw_period_s: 1.0       # [s] fuse one VO yaw per period: its errors are correlated in time,
-                               #     30 Hz of them are not 30x the information
+    vo_vel_std: 0.1            # [m/s] VO body velocity. NOT the message's 0.03: that is only the white noise,
+                               #   VO velocity also has a slowly wandering bias (VO drifts 0.8 m/min, z 0.45 m/min
+                               #   at rest). With 0.03 the filter believes the bias: z 0.4 m off after 8 min idle,
+                               #   27 % inside 2 sigma; with 0.1: 87 %. <= 0 would use the message covariance.
+    vo_vel_period_s: 0.1       # [s] fuse VO velocity at 10 Hz (30 Hz: position 72-88 % inside 2 sigma)
+
+    # --- VO yaw: not fused by default -- it drifts without bound; heading comes from motion
+    vo_yaw_mode: "off"         # off | absolute (step-4 behaviour, kept for comparison)
+    vo_yaw_std_deg: 3.0        # [deg] used only with vo_yaw_mode absolute
+    vo_yaw_period_s: 1.0       # [s] used only with vo_yaw_mode absolute
+
+    # --- zero-rate update: while standing still the mean gyro rate is the bias
+    zaru_enabled: true
+    zaru_window_s: 1.0         # [s] averaging window
+    zaru_max_speed: 0.1        # [m/s] |mean VO velocity| over the window below this ...
+    zaru_max_rate: 0.05        # [rad/s] ... |mean gyro - estimated bias| below this ...
+    zaru_max_rate_std: 0.02    # [rad/s] ... and gyro std below this (no turning, no oscillation)
+    zaru_slack: 0.001          # [rad/s] added to R: residual motion while "still"
+    zupt_enabled: true         # zero-velocity update with the same detection: still means v = 0
+    zupt_std: 0.02             # [m/s] must outweigh 10 Hz of VO velocity, or its bias wins
 
     # --- logging
     report_period_s: 5.0       # [s] period of the "[sensors]" and "[filter]" summaries
