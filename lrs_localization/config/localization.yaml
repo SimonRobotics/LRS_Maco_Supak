@@ -7,6 +7,11 @@ lrs_localization:
     vo_topic: /localization/vo
     imu_topic: /localization/imu
 
+    # --- output
+    odom_topic: /lrs_localization/odom
+    odom_frame: map            # pose frame (ENU, same as GPS)
+    base_frame: base_link      # child frame; twist is expressed here (REP 105)
+
     # --- frames from the sensor contract; a message with other frames is ignored
     gps_frame: map
     vo_frame: vo_odom          # VO pose
@@ -15,6 +20,22 @@ lrs_localization:
 
     # --- timestamps
     reset_jump_s: 1.0          # a stamp this far in the past = simulation reset, not a late sample
+    max_meas_lag_s: 0.1        # [s] a measurement this much older than the filter is applied
+                               #     at the filter time (error |v|*lag); older ones are dropped
+
+    # --- process noise Q: continuous densities, discretised in ekf.hpp
+    q_acc_xy: 0.25             # [m^2/s^3] horizontal acceleration (~0.5 m/s^2 over ~1 s turns)
+    q_acc_z: 0.1               # [m^2/s^3] vertical acceleration
+    q_gyro: 1.0e-6             # [rad^2/s] gyro noise into yaw (measured 0.004^2 * 0.01 s = 1.6e-7, inflated)
+    q_bias: 1.0e-8             # [rad^2/s^3] gyro bias random walk (bias is static, keep it small)
+
+    # --- initial covariance P0 (1 sigma); position uses the first GPS fix's covariance
+    init_vel_std: 1.0          # [m/s]
+    init_yaw_std: 0.1          # [rad] heading taken from VO, which starts aligned with the truth
+    init_bias_std: 0.05        # [rad/s] bias magnitude is ~0.02, either sign
+
+    # --- measurement noise R
+    gps_std_fallback: [0.6, 0.6, 0.9]  # [m] used only if the GPS message has no valid covariance
 
     # --- logging
-    report_period_s: 5.0       # [s] period of the "[sensors] ..." rate summary
+    report_period_s: 5.0       # [s] period of the "[sensors]" and "[filter]" summaries
