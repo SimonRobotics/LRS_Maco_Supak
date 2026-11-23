@@ -26,7 +26,10 @@ lrs_localization:
     # --- process noise Q: continuous densities, discretised in ekf.hpp
     q_acc_xy: 0.25             # [m^2/s^3] horizontal acceleration (~0.5 m/s^2 over ~1 s turns)
     q_acc_z: 0.1               # [m^2/s^3] vertical acceleration
-    q_gyro: 1.0e-6             # [rad^2/s] gyro noise into yaw (measured 0.004^2 * 0.01 s = 1.6e-7, inflated)
+    q_yaw: 2.0e-3              # [rad^2/s] yaw random walk. NOT just the gyro noise (0.004^2 * 0.01 s = 1.6e-7):
+                               #   it also covers the drift of the VO heading, the only yaw measurement, which
+                               #   nothing observes. With 1.6e-7 the filter claims 0.8 deg while the real error
+                               #   reaches 6 deg (31 % inside 2 sigma); with 2e-3: 94 %. See README §2 tuning.
     q_bias: 1.0e-8             # [rad^2/s^3] gyro bias random walk (bias is static, keep it small)
 
     # --- initial covariance P0 (1 sigma); position uses the first GPS fix's covariance
@@ -36,6 +39,10 @@ lrs_localization:
 
     # --- measurement noise R
     gps_std_fallback: [0.6, 0.6, 0.9]  # [m] used only if the GPS message has no valid covariance
+    vo_yaw_std_deg: 3.0        # [deg] VO heading: covers its drift over a mission (~3 deg/min measured),
+                               #       not its 0.3 deg sample noise -- the drift is what the filter must not trust
+    vo_yaw_period_s: 1.0       # [s] fuse one VO yaw per period: its errors are correlated in time,
+                               #     30 Hz of them are not 30x the information
 
     # --- logging
     report_period_s: 5.0       # [s] period of the "[sensors]" and "[filter]" summaries

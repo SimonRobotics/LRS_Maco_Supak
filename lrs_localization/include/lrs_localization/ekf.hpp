@@ -54,7 +54,7 @@ struct ProcessNoise
 {
   double acc_xy{0.5};   // horizontal acceleration [m^2/s^3]
   double acc_z{0.2};    // vertical acceleration [m^2/s^3]
-  double gyro{1e-6};    // gyro rate noise driving yaw [rad^2/s]
+  double yaw{2e-3};     // yaw random walk [rad^2/s]: gyro noise + unobserved VO heading drift
   double bias{1e-8};    // gyro bias random walk [rad^2/s^3]
 };
 
@@ -108,8 +108,8 @@ public:
 
   // Discrete Q(dt) from the continuous densities.
   // Per axis, white acceleration with density q:  [q dt^3/3  q dt^2/2; q dt^2/2  q dt] on (p, v).
-  // (yaw, b) with yaw' = -b + n_gyro, b' = n_bias:
-  //   [qg dt + qb dt^3/3   -qb dt^2/2;  -qb dt^2/2   qb dt]
+  // (yaw, b) with yaw' = -b + n_yaw, b' = n_bias:
+  //   [qy dt + qb dt^3/3   -qb dt^2/2;  -qb dt^2/2   qb dt]
   StateCov processNoiseMatrix(double dt) const
   {
     StateCov Q = StateCov::Zero();
@@ -120,7 +120,7 @@ public:
       Q(kPx + i, kVx + i) = Q(kVx + i, kPx + i) = q * dt2 / 2.0;
       Q(kVx + i, kVx + i) = q * dt;
     }
-    Q(kYaw, kYaw) = q_.gyro * dt + q_.bias * dt3 / 3.0;
+    Q(kYaw, kYaw) = q_.yaw * dt + q_.bias * dt3 / 3.0;
     Q(kYaw, kBias) = Q(kBias, kYaw) = -q_.bias * dt2 / 2.0;
     Q(kBias, kBias) = q_.bias * dt;
     return Q;
@@ -172,6 +172,20 @@ public:
     Eigen::Matrix<double, 3, kNx> H = Eigen::Matrix<double, 3, kNx>::Zero();
     H.block<3, 3>(0, kPx) = Eigen::Matrix3d::Identity();
     return update<3>(z, x_.segment<3>(kPx), H, R);
+  }
+
+  // Heading (VO yaw): z = yaw, H = e_yaw, linear; the innovation is wrapped, so a measurement
+  // of +179 deg against an estimate of -179 deg is a 2 deg correction, not 358 deg.
+  // This is also what makes the gyro bias observable: the prediction integrates (w - b), so a
+  // wrong b makes the predicted yaw walk away from the measured one, and the (yaw, b)
+  // covariance built up by F(yaw, b) = -dt turns that innovation into a bias correction.
+  UpdateResult<1> updateYaw(double z, double var)
+  {
+    Eigen::Matrix<double, 1, kNx> H = Eigen::Matrix<double, 1, kNx>::Zero();
+    H(0, kYaw) = 1.0;
+    return update<1>(
+      Eigen::Matrix<double, 1, 1>(z), Eigen::Matrix<double, 1, 1>(x_(kYaw)), H,
+      Eigen::Matrix<double, 1, 1>(var), {true});
   }
 
 private:

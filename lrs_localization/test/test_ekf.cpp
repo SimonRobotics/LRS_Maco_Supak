@@ -107,6 +107,50 @@ TEST(Ekf8, NonFiniteMeasurementIsNotApplied)
   EXPECT_TRUE(f.x() == before);
 }
 
+TEST(Ekf8, YawInnovationIsWrapped)
+{
+  StateVec x0 = StateVec::Zero();
+  x0(kYaw) = -3.1;
+  Ekf8 f = makeFilter(x0);  // P(yaw) = 0.01
+  // z - yaw = 6.1 rad, but the shortest way is 6.1 - 2pi = -0.18 rad: down through -pi.
+  const auto res = f.updateYaw(3.0, 0.01);
+  ASSERT_TRUE(res.applied);
+  EXPECT_NEAR(res.innovation(0), 6.1 - 2 * M_PI, 1e-12);
+  // K = 0.01 / (0.01 + 0.01) = 0.5: half way, across the seam, and wrapped back into [-pi, pi).
+  EXPECT_NEAR(f.x()(kYaw), wrapAngle(-3.1 + 0.5 * (6.1 - 2 * M_PI)), 1e-12);
+  EXPECT_GT(f.x()(kYaw), 3.0);
+  EXPECT_LT(f.x()(kYaw), M_PI);
+}
+
+// Gyro with an unknown bias of 0.02 rad/s, a turning drone and yaw measured once per second:
+// the bias is not measured directly, but it becomes observable through the yaw innovations.
+TEST(Ekf8, GyroBiasBecomesObservableFromYawUpdates)
+{
+  std::mt19937 rng(2);
+  std::normal_distribution<double> n(0.0, 1.0);
+  const double b_true = 0.02, yaw_sigma = 0.05;
+
+  StateVec x0 = StateVec::Zero();
+  Ekf8 f = makeFilter(x0, 1.0, 0.0);  // bias starts at 0 with sigma 0.05
+  // Here the yaw measurement has white noise only (no drift), so the physical gyro noise is
+  // the right yaw process noise -- not the inflated value tuned for the drifting VO heading.
+  ProcessNoise q;
+  q.yaw = 0.004 * 0.004 * 0.01;
+  f.setProcessNoise(q);
+  double yaw_true = 0.0;
+  for (int k = 1; k <= 6000; ++k) {  // 60 s at 100 Hz
+    const double t = 0.01 * k;
+    const double w_true = 0.3 * std::sin(0.2 * t);   // turning back and forth
+    yaw_true = wrapAngle(yaw_true + w_true * 0.01);
+    f.predictTo(t, w_true + b_true + 0.004 * n(rng));
+    if (k % 100 == 0) {f.updateYaw(wrapAngle(yaw_true + yaw_sigma * n(rng)), yaw_sigma * yaw_sigma);}
+  }
+  const double sb = std::sqrt(f.P()(kBias, kBias));
+  EXPECT_NEAR(f.x()(kBias), b_true, 3.0 * sb);
+  EXPECT_LT(sb, 0.002);  // from 0.05 at the start
+  EXPECT_LT(std::abs(wrapAngle(f.x()(kYaw) - yaw_true)), 3.0 * std::sqrt(f.P()(kYaw, kYaw)));
+}
+
 // Noisy 5 Hz GPS with the simulator's sigmas, 100 Hz prediction: the estimate must converge,
 // follow a constant velocity within its own 3 sigma, and the mean NIS of a consistent filter
 // is the measurement dimension (3). GPS alone determines velocity only loosely (sigma ~0.3 m/s

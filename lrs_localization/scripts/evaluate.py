@@ -23,6 +23,7 @@ from rclpy.serialization import deserialize_message  # noqa: E402
 from rosidl_runtime_py.utilities import get_message  # noqa: E402
 
 EST, TRUTH, GPS = '/lrs_localization/odom', '/evaluation/ground_truth', '/localization/gps'
+STATE, IMU = '/lrs_localization/state', '/localization/imu'  # optional: bias plot
 
 
 def read_bag(path, topics):
@@ -57,7 +58,7 @@ def main():
     ap.add_argument('--name', default=None)
     a = ap.parse_args()
     name = a.name or os.path.basename(os.path.normpath(a.bag))
-    d = read_bag(a.bag, (EST, TRUTH, GPS))
+    d = read_bag(a.bag, (EST, TRUTH, GPS, STATE, IMU))
     if not d[EST] or not d[TRUTH]:
         raise SystemExit(f'{a.bag}: needs {EST} and {TRUTH}')
 
@@ -107,6 +108,22 @@ def main():
           f'yaw {np.mean(np.abs(ey) <= 2 * sy) * 100:.0f} %   (consistent filter: ~95 %)')
     print(f'final 1 sigma: xy {np.mean(sp[-1, :2]):.2f} m, z {sp[-1, 2]:.2f} m, yaw {np.degrees(sy[-1]):.1f} deg')
 
+    # Gyro bias: estimate from the state topic [t, x(8), sigma(8)]; reference = mean of
+    # (IMU wz - truth yaw rate), the same definition as in characterise.py.
+    tb = b_est = b_sig = None
+    b_true = None
+    if d[STATE]:
+        st = np.array([m.data for m in d[STATE]])
+        st = st[np.argsort(st[:, 0])]
+        tb, b_est, b_sig = st[:, 0], st[:, 1 + 7], st[:, 1 + 8 + 7]
+        if d[IMU]:
+            ti = np.array([stamp(m) for m in d[IMU]])
+            wz = np.array([m.angular_velocity.z for m in d[IMU]])
+            ok = (ti >= tt[0]) & (ti <= tt[-1])
+            b_true = np.mean(wz[ok] - np.interp(ti[ok], tt, np.gradient(yt_u, tt)))
+        print(f'gyro bias: estimate {b_est[-1]:+.4f} ± {b_sig[-1]:.4f} rad/s (1σ)'
+              + (f', true {b_true:+.4f} rad/s' if b_true is not None else ''))
+
     os.makedirs(a.out, exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 7))
     if d[GPS]:
@@ -120,7 +137,8 @@ def main():
     fig.tight_layout()
     fig.savefig(os.path.join(a.out, f'{name}_track.png'), dpi=110)
 
-    fig, ax = plt.subplots(5, 1, figsize=(12, 12), sharex=True)
+    rows = 6 if tb is not None else 5
+    fig, ax = plt.subplots(rows, 1, figsize=(12, 2.4 * rows), sharex=True)
     tr = te - t0
     for k, lab in enumerate(('x', 'y', 'z')):
         ax[k].fill_between(tr, -2 * sp[:, k], 2 * sp[:, k], color='tab:orange', alpha=.25, label='±2σ (filter)')
@@ -137,6 +155,16 @@ def main():
     ax[4].set(ylabel='horizontal speed [m/s]', xlabel='t [s]')
     ax[4].legend(loc='upper right')
     ax[4].grid(alpha=.3)
+    if tb is not None:
+        tbr = tb - t0
+        ax[5].fill_between(tbr, b_est - 2 * b_sig, b_est + 2 * b_sig, color='tab:orange', alpha=.25, label='±2σ')
+        ax[5].plot(tbr, b_est, color='tab:orange', lw=1.2, label='estimated gyro bias')
+        if b_true is not None:
+            ax[5].axhline(b_true, color='g', ls='--', label=f'true {b_true:+.4f} (IMU - truth rate)')
+        ax[5].set(ylabel='bias [rad/s]', xlabel='t [s]')
+        ax[5].set_ylim(min(-0.05, (b_true or 0) - 0.02), max(0.05, (b_true or 0) + 0.02))
+        ax[5].legend(loc='upper right')
+        ax[5].grid(alpha=.3)
     fig.suptitle(f'{name}: estimate minus truth with the filter\'s own 2σ')
     fig.tight_layout()
     fig.savefig(os.path.join(a.out, f'{name}_errors.png'), dpi=110)

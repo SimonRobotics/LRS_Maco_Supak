@@ -31,6 +31,7 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
 
 using lrs_localization::Ekf8;
 using lrs_localization::SensorChannel;
@@ -95,7 +96,7 @@ public:
     lrs_localization::ProcessNoise q;
     q.acc_xy = declare_parameter("q_acc_xy", q.acc_xy);
     q.acc_z = declare_parameter("q_acc_z", q.acc_z);
-    q.gyro = declare_parameter("q_gyro", q.gyro);
+    q.yaw = declare_parameter("q_yaw", q.yaw);
     q.bias = declare_parameter("q_bias", q.bias);
     q_ = q;
     ekf_.setProcessNoise(q_);
@@ -105,11 +106,18 @@ public:
     gps_std_fallback_ = declare_parameter("gps_std_fallback", std::vector<double>{0.6, 0.6, 0.9});
     if (gps_std_fallback_.size() != 3) {throw std::runtime_error("gps_std_fallback needs 3 values");}
     max_lag_ = declare_parameter("max_meas_lag_s", 0.1);
+    const double vo_yaw_std = declare_parameter("vo_yaw_std_deg", 3.0) * M_PI / 180.0;
+    vo_yaw_var_ = vo_yaw_std * vo_yaw_std;
+    vo_yaw_period_ = declare_parameter("vo_yaw_period_s", 1.0);
 
     odom_frame_ = declare_parameter("odom_frame", std::string("map"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>(
       declare_parameter("odom_topic", std::string("/lrs_localization/odom")), 10);
+    // Debug/plotting only: [t, x(8), sigma(8)] -- the full state incl. the gyro bias, which
+    // the Odometry message has no field for.
+    state_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>(
+      declare_parameter("state_topic", std::string("/lrs_localization/state")), 10);
 
     // The sensor simulator publishes best effort; a reliable subscriber would get nothing.
     const auto qos = rclcpp::SensorDataQoS();
@@ -170,12 +178,27 @@ private:
     ++gps_nis_n_;
   }
 
-  // VO is not fused yet; its yaw is only used to initialise the filter's heading.
+  // VO yaw: initial heading, then the heading measurement. GPS has no orientation, so VO is
+  // the only heading sensor. Its errors are dominated by a slow drift (~3 deg/min measured),
+  // i.e. strongly correlated in time: fusing all 30 Hz samples as independent would make the
+  // filter far more certain of yaw than it is. One sample per vo_yaw_period_s with a sigma
+  // that covers the drift over a mission (vo_yaw_std_deg) matches the real information.
   void onVo(const nav_msgs::msg::Odometry & m)
   {
-    if (!accept(vo_, toSec(m.header.stamp), m.header.frame_id, m.child_frame_id)) {return;}
+    const double t = toSec(m.header.stamp);
+    if (!accept(vo_, t, m.header.frame_id, m.child_frame_id)) {return;}
     vo_yaw_ = quatYaw(m.pose.pose.orientation);
     have_vo_yaw_ = true;
+    if (!ekf_.initialized() || t - last_vo_yaw_t_ < vo_yaw_period_) {return;}
+    if (!bringTo(vo_, t)) {return;}
+    const auto res = ekf_.updateYaw(vo_yaw_, vo_yaw_var_);
+    if (!res.applied) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[vo] yaw update produced non-finite values, skipped");
+      return;
+    }
+    last_vo_yaw_t_ = t;
+    vo_yaw_nis_sum_ += res.nis;
+    ++vo_yaw_nis_n_;
   }
 
   // ------------------------------------------------------------ filter helpers
@@ -274,6 +297,13 @@ private:
     o.twist.covariance[3 * 6 + 3] = o.twist.covariance[4 * 6 + 4] = 1e6;
     o.twist.covariance[5 * 6 + 5] = gyro_var_ + P(idx::kBias, idx::kBias);
     odom_pub_->publish(o);
+
+    std_msgs::msg::Float64MultiArray st;
+    st.data.reserve(1 + 2 * lrs_localization::kNx);
+    st.data.push_back(ekf_.time());
+    for (int i = 0; i < lrs_localization::kNx; ++i) {st.data.push_back(x(i));}
+    for (int i = 0; i < lrs_localization::kNx; ++i) {st.data.push_back(std::sqrt(P(i, i)));}
+    state_pub_->publish(st);
   }
 
   // Frame and stamp check shared by all three inputs. Logs at most once per problem kind
@@ -310,6 +340,7 @@ private:
         ekf_ = Ekf8();
         ekf_.setProcessNoise(q_);
         have_vo_yaw_ = false;
+        last_vo_yaw_t_ = -1e9;
         return true;
       default:
         RCLCPP_WARN_THROTTLE(
@@ -355,14 +386,16 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "[filter] t=%.1f p=(%.2f, %.2f, %.2f) v=(%.2f, %.2f, %.2f) yaw=%.1f deg b=%+.4f rad/s | "
-      "sigma xy %.2f m, z %.2f m, yaw %.1f deg | GPS updates %zu, mean NIS %.2f (expect 3)",
+      "sigma xy %.2f m, z %.2f m, yaw %.1f deg, b %.4f | updates (mean NIS, expect dim): "
+      "GPS %zu (%.2f/3), VO yaw %zu (%.2f/1)",
       ekf_.time(), x(idx::kPx), x(idx::kPy), x(idx::kPz), x(idx::kVx), x(idx::kVy), x(idx::kVz),
       x(idx::kYaw) * 180.0 / M_PI, x(idx::kBias),
       std::sqrt(0.5 * (P(idx::kPx, idx::kPx) + P(idx::kPy, idx::kPy))), std::sqrt(P(idx::kPz, idx::kPz)),
-      std::sqrt(P(idx::kYaw, idx::kYaw)) * 180.0 / M_PI,
-      gps_nis_n_, gps_nis_n_ ? gps_nis_sum_ / gps_nis_n_ : 0.0);
-    gps_nis_sum_ = 0.0;
-    gps_nis_n_ = 0;
+      std::sqrt(P(idx::kYaw, idx::kYaw)) * 180.0 / M_PI, std::sqrt(P(idx::kBias, idx::kBias)),
+      gps_nis_n_, gps_nis_n_ ? gps_nis_sum_ / gps_nis_n_ : 0.0,
+      vo_yaw_nis_n_, vo_yaw_nis_n_ ? vo_yaw_nis_sum_ / vo_yaw_nis_n_ : 0.0);
+    gps_nis_sum_ = vo_yaw_nis_sum_ = 0.0;
+    gps_nis_n_ = vo_yaw_nis_n_ = 0;
   }
 
   SensorChannel gps_, vo_, imu_;
@@ -381,12 +414,16 @@ private:
   std::size_t late_dropped_{0};
   double gps_nis_sum_{0.0};
   std::size_t gps_nis_n_{0};
+  double vo_yaw_var_{0.0}, vo_yaw_period_{1.0}, last_vo_yaw_t_{-1e9};
+  double vo_yaw_nis_sum_{0.0};
+  std::size_t vo_yaw_nis_n_{0};
   std::string odom_frame_, base_frame_;
 
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gps_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr vo_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr state_pub_;
   rclcpp::TimerBase::SharedPtr report_timer_;
 };
 

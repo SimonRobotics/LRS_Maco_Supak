@@ -7,7 +7,7 @@ that fuses noisy GPS, drifting visual odometry and a biased yaw gyro.
 | Section | Status |
 |---|---|
 | §1 Sensor acquisition and characterisation | done — [characterisation](../docs/a2_charakterizacia_senzorov.md) |
-| §2 Eight-state KF/EKF | prediction (constant velocity, gyro yaw) + GPS update; yaw/VO updates next |
+| §2 Eight-state KF/EKF | prediction, GPS update, VO yaw update (gyro bias estimated); VO velocity next |
 | §3 Missing and bad measurements | – |
 | §4 Flight using estimated localisation | – |
 
@@ -56,7 +56,24 @@ than real time — and compared with the truth that is in the same bag:
 ```bash
 lrs_localization/scripts/replay.sh bags/a2_flight_seed42 /tmp/replay_flight
 python3 lrs_localization/scripts/evaluate.py /tmp/replay_flight --out /tmp/figures
+
+# try a parameter without editing the config: everything after the rate goes to the node
+lrs_localization/scripts/replay.sh bags/a2_flight_seed42 /tmp/replay_q 4 -p q_yaw:=1.0e-6
 ```
+
+Besides `/lrs_localization/odom` the node publishes `/lrs_localization/state`
+(`std_msgs/Float64MultiArray`, `[t, x(8), sigma(8)]`) for plotting only — it is the one place
+the gyro bias can be seen.
+
+### Live view
+
+```bash
+python3 lrs_localization/scripts/live_plot.py
+```
+
+A separate evaluation process (it reads the truth, publishes nothing): top view with truth,
+estimate and its 2σ ellipse, the last GPS fixes and VO; on the right the x/y and yaw error of
+the estimate against the filter's own 2σ and the gyro bias estimate. Times are header stamps.
 
 [`evaluate.py`](scripts/evaluate.py) is an offline evaluation tool: it is the only place besides
 [`characterise.py`](scripts/characterise.py) that reads `/evaluation/ground_truth`, and it sends
@@ -70,7 +87,7 @@ Nothing else reaches the estimator, in particular no ground truth and no MAVROS 
 | Topic | Type | Expected frame | Used fields |
 |---|---|---|---|
 | `/localization/gps` | `geometry_msgs/PoseWithCovarianceStamped` | `map` | position, its covariance |
-| `/localization/vo` | `nav_msgs/Odometry` | `vo_odom` → child `base_link` | yaw (initialisation so far) |
+| `/localization/vo` | `nav_msgs/Odometry` | `vo_odom` → child `base_link` | yaw (initialisation, heading update at 1 Hz) |
 | `/localization/imu` | `sensor_msgs/Imu` | `base_link` | `angular_velocity.z` only |
 
 - **QoS:** `rclcpp::SensorDataQoS()` (best effort), matching the sensor simulator. A reliable
@@ -118,11 +135,11 @@ P   <- F P F^T + Q(dt)
 ```
 
 `Q(dt)` is the exact discretisation of white noise with densities `q_acc_xy`, `q_acc_z` on the
-acceleration (per axis `[q dt³/3, q dt²/2; q dt²/2, q dt]` on (p, v)), `q_gyro` on the yaw rate
-and `q_bias` on the bias random walk (`[qg dt + qb dt³/3, −qb dt²/2; −qb dt²/2, qb dt]` on (yaw, b)).
+acceleration (per axis `[q dt³/3, q dt²/2; q dt²/2, q dt]` on (p, v)), `q_yaw` on the yaw rate
+and `q_bias` on the bias random walk (`[qy dt + qb dt³/3, −qb dt²/2; −qb dt²/2, qb dt]` on (yaw, b)).
 
-**Asynchronous timing.** Every gyro sample predicts the filter to its own stamp. A GPS fix
-first predicts forward to its stamp (with the latest gyro rate), then corrects. A fix that is
+**Asynchronous timing.** Every gyro sample predicts the filter to its own stamp. A GPS or VO
+measurement first predicts forward to its stamp (with the latest gyro rate), then corrects. One that is
 slightly older than the filter (it arrived after a newer gyro sample; up to `max_meas_lag_s`)
 is applied at the filter time — the error is `|v|·lag`, a few millimetres; older ones are
 dropped and counted. Nothing ever waits for the three sensors to line up.
@@ -138,6 +155,49 @@ NIS = r^T S^-1 r      (mean 3 for a consistent filter; printed in the [filter] r
 
 An update whose result is not finite is not applied.
 
+**VO yaw update**, linear, the only heading measurement (GPS has no orientation):
+
+```text
+z = yaw_vo     H = e_yaw     R = vo_yaw_std²     r = wrap(z - yaw)   -> wrapped innovation
+```
+
+The innovation is wrapped to `[-pi, pi)`, so +179° measured against −179° estimated is a 2°
+correction, not 358°; the corrected yaw is wrapped again.
+
+**How the gyro bias becomes observable.** No sensor measures `b` directly. The prediction
+integrates `w − b`; if the estimated `b` is wrong, the predicted yaw walks away from the VO yaw
+at the rate `b_true − b_est`. The prediction itself builds the covariance `P(yaw, b)` (through
+`F(yaw, b) = −dt`), so the Kalman gain of a yaw update has a non-zero `b` row and every yaw
+innovation also corrects the bias. With seed 42 the bias goes from 0 to −0.016 rad/s in ~8 s
+(true −0.017, figure below).
+
+**Choice: VO yaw at 1 Hz with σ = 3°, `q_yaw` inflated.** VO yaw has small sample noise (0.3°)
+but drifts ~3°/min (characterisation). That drift is a slowly changing error, strongly
+correlated in time, and no other sensor observes it — the filter follows the VO heading, drift
+included. Treating 30 samples per second as independent would make `P(yaw)` tiny while the real
+error grows. So:
+- only one VO yaw per second is fused (`vo_yaw_period_s`), with σ = 3° (`vo_yaw_std_deg`), the
+  drift accumulated over a mission;
+- `q_yaw` is not the gyro's white noise (0.004² · 0.01 s = 1.6·10⁻⁷) but 2·10⁻³: yaw process
+  noise that also covers the wander of the heading reference.
+
+Replay of the flight bag; the yaw error itself does not change — it is the VO drift — only
+whether the filter admits it:
+
+| `q_yaw` [rad²/s] | yaw RMS error | yaw inside own 2σ | estimated bias (true −0.0170) |
+|---|---:|---:|---:|
+| 1·10⁻⁶ (≈ gyro noise) | 3.38° | 31 % | −0.0162 |
+| 1·10⁻⁴ | 3.38° | 50 % | −0.0161 |
+| 1·10⁻³ | 3.41° | 82 % | −0.0160 |
+| **2·10⁻³** | 3.39° | **94 %** | −0.0160 |
+| 5·10⁻³ | 3.40° | 99 % | −0.0158 |
+
+Fusing VO yaw at 30 Hz with σ 0.5° or at 1 Hz with σ 1° gives the same 3.4° but only 2 % and
+12 % inside 2σ. Consequences of following the VO heading: the bias estimate absorbs the VO yaw
+drift rate (−0.016 instead of −0.017), and NIS of the VO yaw updates is ≈ 0.01 instead of 1 —
+the innovations against VO are tiny because filter and VO drift together; `R` is chosen for the
+error against the truth, which the innovations cannot show.
+
 **Initialisation**, from the inputs only: position = first GPS fix with its own covariance,
 yaw = current VO yaw (the VO frame starts aligned with the true pose), velocity and bias 0.
 Nothing is hard-coded.
@@ -145,37 +205,49 @@ Nothing is hard-coded.
 | Parameter | Value | Meaning |
 |---|---|---|
 | `q_acc_xy`, `q_acc_z` | 0.25, 0.1 m²/s³ | acceleration noise density (≈ 0.5 m/s² over ~1 s turns) |
-| `q_gyro` | 1·10⁻⁶ rad²/s | gyro noise into yaw (measured 0.004² · 0.01 s = 1.6·10⁻⁷, inflated) |
+| `q_yaw` | 2·10⁻³ rad²/s | yaw random walk: gyro noise + unobserved VO heading drift (tuning above) |
 | `q_bias` | 1·10⁻⁸ rad²/s³ | bias random walk (the bias is static) |
 | `P0` position | GPS covariance | 0.36, 0.36, 0.81 m² |
 | `init_vel_std` | 1.0 m/s | |
 | `init_yaw_std` | 0.1 rad | |
 | `init_bias_std` | 0.05 rad/s | bias magnitude ~0.02 rad/s, either sign |
 | `R` GPS | message covariance | fallback `gps_std_fallback` 0.6, 0.6, 0.9 m |
+| `R` VO yaw | (3°)², 1 Hz | `vo_yaw_std_deg`, `vo_yaw_period_s` |
 
-Every ~5 s the node prints the state, its sigmas and the mean GPS NIS:
+Every ~5 s the node prints the state, its sigmas and the mean NIS per measurement type:
 
 ```text
-[filter] t=98.4 p=(-6.85, 13.05, 2.08) v=(-0.65, 0.14, 0.20) yaw=88.8 deg b=+0.0000 rad/s | sigma xy 0.37 m, z 0.45 m, yaw 268.5 deg | GPS updates 50, mean NIS 2.81 (expect 3)
+[filter] t=101.0 p=(-7.56, 13.07, 1.86) v=(-0.51, 0.16, 0.09) yaw=174.8 deg b=-0.0161 rad/s | sigma xy 0.39 m, z 0.47 m, yaw 3.1 deg, b 0.0044 | updates (mean NIS, expect dim): GPS 74 (2.85/3), VO yaw 15 (0.01/1)
 ```
 
-### Results so far: prediction + GPS only
+### Results so far: prediction + GPS + VO yaw
 
-Replay of `bags/a2_flight_seed42` (two laps of the §4 rectangle); a live run with the full
-simulator gives the same numbers (horizontal 0.47 m, 96–98 % inside 2σ):
+Replay of `bags/a2_flight_seed42` (two laps of the §4 rectangle) and `bags/a2_static_seed73`
+(another seed, another bias):
 
-| | estimate | raw GPS |
-|---|---:|---:|
-| RMS error horizontal | 0.50 m | 0.87 m |
-| RMS error z | 0.44 m | 0.93 m |
-| inside the filter's own 2σ (x, y, z) | 97 %, 97 %, 96 % | |
+| | flight, seed 42 | static, seed 73 | GPS only (previous step) |
+|---|---:|---:|---:|
+| RMS error horizontal | 0.50 m | 0.48 m | 0.50 m (raw GPS 0.87 m) |
+| RMS error z | 0.44 m | 0.42 m | 0.44 m (raw GPS 0.93 m) |
+| RMS error yaw | **3.4°** | 0.4° | 61° |
+| inside own 2σ (x, y, z, yaw) | 97, 97, 96, 94 % | 99, 98, 98, 100 % | yaw: σ unbounded |
+| gyro bias estimate (true) | −0.0160 ± 0.0044 (−0.0170) | −0.0238 ± 0.0059 (−0.0239) | not observable |
 
-![GPS-only errors](../docs/figures/a2/kf_gps_only_errors.png)
+![VO yaw errors](../docs/figures/a2/kf_vo_yaw_errors.png)
 
-The position is better than raw GPS and consistent with its covariance. Two things are still
-missing and are visible in the figure: velocity from GPS alone is noisy (≈ 0.3–0.5 m/s error),
-and nothing measures yaw yet, so it drifts with the uncorrected bias (−1°/s) and its 2σ grows
-without bound. The VO yaw and VO body-velocity updates come next.
+Yaw is now bounded and the bias is estimated for either seed. Still missing: the velocity comes
+from GPS alone (≈ 0.47 m/s RMS error, the noisy speed in the figure), which also limits the
+position.
+
+**Known limitation found in a long live run.** After ~60 min of simulation time (three flights)
+VO yaw was 113° off the truth, VO position 36 m away — and the estimate followed the VO heading
+(yaw error −113°, position still fine thanks to GPS). The 2-minute bags only show a few degrees
+of this drift. Fusing the absolute VO yaw therefore ties the filter's heading to a reference
+that drifts without bound; in a defence the simulation may run for minutes before the mission.
+Next step: the absolute heading will come from motion — the VO body-velocity update couples
+velocity and yaw, and GPS sees the same motion in ENU — while VO yaw is used only relatively
+(its change) to keep the bias observable, and the initial heading comes from the known spawn
+yaw instead of a possibly drifted VO.
 
 ## Tests
 
@@ -186,5 +258,6 @@ colcon test --packages-select lrs_localization && colcon test-result --verbose
 - [`test_sensor_channel.cpp`](test/test_sensor_channel.cpp) — frame and stamp checks, rates, gaps;
 - [`test_ekf.cpp`](test/test_ekf.cpp) — angle wrapping, constant-velocity and gyro prediction,
   forward-only time, 15 s without measurements stays finite, the GPS update equals the scalar
-  Kalman gain, non-finite updates are rejected, and a simulated 60 s flight with noisy 5 Hz
-  GPS is tracked within its own 3σ with mean NIS ≈ 3.
+  Kalman gain, non-finite updates are rejected, a simulated 60 s flight with noisy 5 Hz
+  GPS is tracked within its own 3σ with mean NIS ≈ 3, the yaw innovation is wrapped across
+  ±π, and an unknown gyro bias becomes observable from yaw updates alone.
