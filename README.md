@@ -12,6 +12,34 @@ mission, dependencies and results.
 | Figures | [`docs/figures/`](docs/figures/) |
 | Documentation (A1.4) | [`docs/LRS_dokumentacia.pdf`](docs/LRS_dokumentacia.pdf) |
 
+# LRS – Assignment 2: drone localisation
+
+An eight-state EKF ([`lrs_localization/`](lrs_localization/)) fuses noisy GPS, drifting visual
+odometry and a biased gyro. A separate controller node
+([`estimated_flight_node`](lrs_mission/src/estimated_flight_node.cpp) in `lrs_mission`) flies the
+two-lap route using **only** that estimate. All four sections (§1–§4) are done.
+
+| | |
+|---|---|
+| Estimator output | `/lrs_localization/odom` (`nav_msgs/Odometry`), frame `map` (ENU), child `base_link`, 100 Hz |
+| Packages | [`lrs_localization/`](lrs_localization/) (estimator, tests, evaluation scripts), [`lrs_mission/`](lrs_mission/) (`estimated_flight_node`, `estimated.launch.py`) |
+| README: equations, `Q`, `R`, `P0`, gate, results, how to run | [`lrs_localization/README.md`](lrs_localization/README.md) |
+| Documentation (choices, pros/cons, diagrams; Slovak) | [`docs/a2_dokumentacia.md`](docs/a2_dokumentacia.md) |
+| Sensor characterisation (§1; Slovak) | [`docs/a2_charakterizacia_senzorov.md`](docs/a2_charakterizacia_senzorov.md) |
+| Recordings | characterisation: [`bags/a2_static_seed42`](bags/a2_static_seed42), [`bags/a2_flight_seed42`](bags/a2_flight_seed42); autonomous flights with the 15 s GPS outage and outliers: [`bags/a2_s4_flight_seed42`](bags/a2_s4_flight_seed42), [`…seed7`](bags/a2_s4_flight_seed7), [`…seed73`](bags/a2_s4_flight_seed73). Index with timestamps: [documentation §5](docs/a2_dokumentacia.md#5-odovzdávané-nahrávky) |
+| Figures | [`docs/figures/a2/`](docs/figures/a2/) |
+
+Quick start (five terminals, same seed for Gazebo and the sensors):
+
+```bash
+colcon build --packages-select localization_sensor_sim lrs_localization lrs_mission && source install/setup.bash
+gz sim -r -v 4 --seed 42 "$PWD/worlds/fei_lrs_gazebo_localization.world"
+source ~/venv-ardupilot/bin/activate && scripts/run_sitl.sh
+scripts/run_mavros.sh
+ros2 launch localization_sensor_sim localization_sensors.launch.py seed:=42
+ros2 launch lrs_mission estimated.launch.py      # estimator + autonomous flight, no further input
+```
+
 Everything below is the original course repository README (simulation setup).
 
 ---

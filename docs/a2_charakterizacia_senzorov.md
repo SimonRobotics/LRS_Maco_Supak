@@ -31,6 +31,10 @@ ros2 run lrs_mission lrs_mission_node --ros-args --params-file install/lrs_missi
   -p map_file:=$PWD/install/lrs_mission/share/lrs_mission/maps/FEI_LRS_PCD/map.pcd -p max_speed:=0.5
 ```
 
+Pri opakovaní pridať `-p use_sim_time:=true`: A1 uzol posúva cieľ s `now()` a v reálnom čase by pri
+Gazebe pomalšom než reálny čas letel rýchlejšie ako 0,5 m/s (pozri
+[README §3](../lrs_localization/README.md#results)).
+
 Grafy a čísla:
 
 ```bash
