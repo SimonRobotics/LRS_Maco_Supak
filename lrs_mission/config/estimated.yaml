@@ -1,0 +1,37 @@
+# A2 §4: flight on the estimated localisation (estimated_flight_node.cpp).
+# Feedback is /lrs_localization/odom only; see lrs_localization/README.md.
+lrs_estimated_flight:
+  ros__parameters:
+    use_sim_time: true         # all timing (sliding reference, settling) in simulation time.
+                               #   The A1 node in wall time flew 2 m/s when Gazebo ran at 0.3x.
+
+    # --- mission (localization.md §4): ENU offsets from the origin = first valid estimate
+    route: [0.0, 0.0,  0.0, -4.0,  2.5, -4.0,  2.5, 0.0,  0.0, 0.0]   # x, y pairs [m]
+    laps: 2
+    altitude: 2.0              # [m] above the origin's estimated height
+    speed: 0.5                 # [m/s] cruise speed of the sliding reference
+    ref_accel: 0.5             # [m/s^2] the reference accelerates/brakes at this rate on every segment,
+                               #   so it stops at the corners. Without it (instant stop) the drone overshot
+                               #   the corners by up to 0.55 m. Cost: ~1 s per segment.
+
+    # --- origin: the estimate must be fresh and converged for origin_settle_s
+    origin_max_sigma: 0.3      # [m] sigma xy (converged filter: ~0.1 m)
+    origin_settle_s: 3.0       # [s]
+
+    # --- outer loop: v = v_ff + kp (ref - est), limited
+    kp: 0.8                    # [1/s] 0.5 m error -> 0.4 m/s correction; time constant 1.25 s
+    kp_z: 0.8                  # [1/s]
+    max_speed: 1.0             # [m/s] horizontal command limit (2x the route speed)
+    max_speed_z: 0.5           # [m/s]
+    max_accel: 1.0             # [m/s^2] command slew limit: a 0.5 m estimate step (GPS fix while VO
+                               #   is lost) becomes a 0.4 m/s change spread over 0.4 s, not a jerk
+    reach_tolerance: 0.25      # [m] waypoint reached: reference at the end AND estimate this close
+    land_tolerance: 0.15       # [m] over the origin before landing ...
+    land_max_speed: 0.1        # [m/s] ... below this estimated speed ...
+    land_settle_s: 1.0         # [s] ... for this long
+
+    # --- safety
+    estimate_timeout_s: 0.5    # [s] no estimate -> zero velocity (hover)
+    estimate_lost_land_s: 3.0  # [s] still none -> LAND
+    climb_timeout_s: 15.0      # [s] take over the climb if our z never reaches altitude - 0.2 m
+    rate_hz: 20.0              # setpoint stream (ArduPilot drops guided velocity after ~3 s)

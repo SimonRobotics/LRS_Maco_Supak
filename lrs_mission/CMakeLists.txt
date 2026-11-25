@@ -24,7 +24,11 @@ target_link_libraries(lrs_mission_node ${PCL_LIBRARIES})
 ament_target_dependencies(lrs_mission_node
   rclcpp geometry_msgs mavros_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs)
 
-install(TARGETS lrs_mission_node DESTINATION lib/${PROJECT_NAME})
+# A2 §4: flight on the estimated localisation -- no PCL, no MAVROS pose
+add_executable(estimated_flight_node src/estimated_flight_node.cpp)
+ament_target_dependencies(estimated_flight_node rclcpp geometry_msgs mavros_msgs nav_msgs)
+
+install(TARGETS lrs_mission_node estimated_flight_node DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS scripts/plot_bag.py DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME})
 # Map and mission files live at the repository root; ship them with the package.

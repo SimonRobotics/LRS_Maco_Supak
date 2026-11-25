@@ -9,7 +9,7 @@ that fuses noisy GPS, drifting visual odometry and a biased yaw gyro.
 | §1 Sensor acquisition and characterisation | done — [characterisation](../docs/a2_charakterizacia_senzorov.md) |
 | §2 Eight-state KF/EKF | done — prediction, GPS, VO body velocity (EKF), zero-rate/zero-velocity updates |
 | §3 Missing and bad measurements | done — innovation gate, timeouts, gyro-less prediction, recovery from permanent rejection |
-| §4 Flight using estimated localisation | – |
+| §4 Flight using estimated localisation | done — [`estimated_flight_node`](../lrs_mission/src/estimated_flight_node.cpp), velocity control on `/lrs_localization/odom` only, seeds 42 / 7 / 73 flown with GPS outage and outliers |
 
 ## Build
 
@@ -464,6 +464,123 @@ Replays: [seed 42](../docs/figures/a2/kf_s3_replay_seed42_errors.png),
 | `vo_max_rejections` | 10 (1 s) | |
 | `gps_timeout_s`, `vo_timeout_s`, `imu_timeout_s` | 1.0, 0.5, 0.2 s | 5 / 15 / 20 missed samples, logs only (IMU: also switches the prediction) |
 | `imu_lost_yaw_rate_std` | 1.0 rad/s | largest yaw rate of the mission |
+
+## §4 Flight using estimated localisation
+
+Controller: [`lrs_mission/src/estimated_flight_node.cpp`](../lrs_mission/src/estimated_flight_node.cpp),
+parameters in [`lrs_mission/config/estimated.yaml`](../lrs_mission/config/estimated.yaml).
+
+```bash
+# terminals 1-4 as in "Run" above (Gazebo, SITL, MAVROS, sensor simulator), then:
+ros2 launch lrs_mission estimated.launch.py        # estimator + controller, no further input
+# optional, the teacher's test during the flight:
+python3 lrs_localization/scripts/teacher_tests.py --schedule "5 outlier; 15 gps_off; 20 outlier; 30 gps_on"
+```
+
+```text
+/localization/gps ─┐                                   ┌─ /mavros/state ─────────────────────────┐
+/localization/vo  ─┼─> lrs_localization ─> /lrs_localization/odom ─> lrs_estimated_flight ─> /mavros/setpoint_raw/local
+/localization/imu ─┘       (EKF, §2-3)         (map = ENU)              │        (velocity + yaw)        │
+                                                                        └─> set_mode / arming / takeoff / land ─> MAVROS ─> ArduPilot
+```
+
+**A separate node, not a mode of the A1 node.** `lrs_mission_node` subscribes to
+`/mavros/local_position/pose` and `velocity_local` in its constructor whatever the mission. A new
+mode inside it would still show those forbidden subscriptions in the ROS graph. The new node is
+~400 lines and its complete input list is short enough to check at a glance:
+
+```text
+$ ros2 node info /lrs_estimated_flight          (during each of the three flights below)
+  Subscribers:
+    /clock: rosgraph_msgs/msg/Clock
+    /lrs_localization/odom: nav_msgs/msg/Odometry
+    /mavros/state: mavros_msgs/msg/State
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+  Publishers:
+    /lrs_estimated_flight/reference, /mavros/setpoint_raw/local, /parameter_events, /rosout
+  Service Clients:
+    /mavros/cmd/arming, /mavros/cmd/land, /mavros/cmd/takeoff, /mavros/set_mode
+```
+
+**Mission.**
+1. The origin is the first valid estimate: fresh (< 0.5 s), finite, frame `map`, σ xy < 0.3 m,
+   held for 3 s.
+2. GUIDED, arm, `cmd/takeoff` to 2 m. ArduPilot's takeoff controller climbs, and the climb counts
+   as done when *our* estimated height reaches 1.8 m.
+3. Two laps through `(0,0) → (0,−4) → (2.5,−4) → (2.5,0) → (0,0)` relative to the origin, in ENU.
+4. Hold over the origin until the estimate is within 0.15 m and slower than 0.1 m/s for 1 s,
+   then `cmd/land`. Done when MAVROS reports disarmed.
+
+**Controller.** A reference point slides along each segment with a trapezoidal speed profile
+(up to 0.5 m/s, accelerating and braking at 0.5 m/s², stopping at each corner). The command is
+
+```text
+v_xy = v_ref + kp (r - p_est)      kp = 0.8 1/s,   |v_xy| <= 1.0 m/s
+v_z  = kp_z (z_ref - z_est)        kp_z = 0.8 1/s, |v_z| <= 0.5 m/s
+v changes by at most 1.0 m/s² · dt (slew limit)
+```
+
+sent as an ENU velocity with a fixed yaw (the estimated yaw at the origin) on
+`/mavros/setpoint_raw/local` (`type_mask`: velocity + yaw).
+- **Why velocity, not position setpoints.** With a position setpoint ArduPilot would close the
+  position loop on its *own* EKF, and our estimate would only pick the target. With velocity
+  setpoints the position loop runs on our estimate, and ArduPilot only tracks a velocity.
+- **What still comes from ArduPilot.** Attitude and heading, which every multicopter needs to fly.
+  ENU velocity directions are expressed in ArduPilot's frame, which equals our `map` frame (both
+  are MAVROS local ENU). Takeoff and landing use its controllers (services allowed by the
+  assignment). Where to take off and when to land is decided on our estimate.
+- **Waypoint reached** = the reference has stopped at the corner AND the estimate is within 0.25 m.
+- **`kp` = 0.8** gives a 1.25 s time constant: slow enough to filter the estimate's GPS steps,
+  fast enough to hold 0.5 m/s. The slew limit is there for the VO-outage case from §3, where a
+  GPS fix can move the estimate by 0.5 m: a 0.4 m/s jump becomes a 0.4 s ramp.
+- **Trapezoidal profile.** The first version stopped the reference dead at each corner. The drone,
+  ~1 s behind it, overshot the corners by up to 0.55 m (seed 42: the estimate was 0.08 m from the
+  truth there, so this was the controller). With the profile, the estimate stays within 0.08 m RMS
+  of the path. It costs ~1 s per segment.
+- **Simulation time** (`use_sim_time: true`) for the sliding reference and all hold times. The A1
+  node in wall time flew at 2 m/s when Gazebo ran at 0.3× (§3).
+- **Safety.** No estimate for 0.5 s → zero velocity (hover). For 3 s → LAND. A mode change by
+  someone else, or a disarm, stops the setpoints.
+
+**Flights.** Each flight ran unattended from `ros2 launch` to touchdown, with `teacher_tests.py`
+calling the services. GPS was off for 15 s in the middle of lap 1 (seed 73: start of lap 2), with
+one outlier injected in flight and one requested during the outage (it lands on the first fix
+after it). Bags: [`bags/a2_s4_flight_seed42`](../bags/a2_s4_flight_seed42),
+[`…seed7`](../bags/a2_s4_flight_seed7), [`…seed73`](../bags/a2_s4_flight_seed73) (sensors, truth,
+estimate, controller reference, setpoints, `/mavros/state`, `/rosout`).
+
+| | seed 42 | seed 7 | seed 73 |
+|---|---:|---:|---:|
+| completed unattended: takeoff, 2 laps, return, landing | yes | yes | yes |
+| airborne (truth) / first estimate → touchdown | 69 s / 90 s | 69 s / 90 s | 70 s / 90 s |
+| outlier in flight, NIS → | 191 → rejected | 74 → rejected | 65 → rejected |
+| outlier on the first fix after the 15 s outage | 167 → rejected | 138 → rejected | 149 → rejected |
+| estimate error at the end of the GPS outage (2σ) | 0.18 m (0.55) | 0.44 m (0.54) | 0.40 m (0.56) |
+| estimate RMS horizontal / z / yaw, whole flight | 0.15 m / 0.10 m / 1.7° | 0.21 m / 0.11 m / 1.5° | 0.20 m / 0.15 m / 0.7° |
+| **controller**: estimate off the commanded path, RMS / max | 0.08 / 0.28 m | 0.09 / 0.32 m | 0.08 / 0.27 m |
+| **result**: real drone (truth) off the path, RMS / max | 0.09 / 0.29 m | 0.19 / 0.64 m | 0.15 / 0.57 m |
+| height (truth) vs reference, RMS | 0.07 m | 0.06 m | 0.15 m |
+| landed from the takeoff point (truth) | 0.12 m | 0.39 m | 0.34 m |
+
+The first-estimate-to-touchdown time includes ~10 s on the ground while ArduPilot's pre-arm checks
+finish (the arming request is repeated each second). The flight itself takes 69–70 s.
+
+**Where the remaining error comes from.** The controller keeps its feedback within ~0.3 m of the
+path everywhere (row "controller"). The rest of the gap between the real drone and the path is the
+estimate's own error, and the drone follows that faithfully. The largest part builds up during the
+GPS outage, when VO velocity bias moves the estimate by up to 0.46 m (seed 7: the whole of lap 2 is
+shifted ~0.4 m, visible in its top view). That is still inside the filter's 2σ, and the next good fixes
+pull it back without a step. The landing offsets of 0.3–0.4 m on seeds 7 and 73 are the same thing:
+the estimate was 0.08–0.18 m from the origin at touchdown, the truth 0.34–0.39 m.
+
+![Flight on the estimate, seed 7: top view](../docs/figures/a2/kf_s4_flight_seed7_track.png)
+![Flight on the estimate, seed 42: errors](../docs/figures/a2/kf_s4_flight_seed42_errors.png)
+
+Other figures: [seed 42 top view](../docs/figures/a2/kf_s4_flight_seed42_track.png),
+[seed 7 errors](../docs/figures/a2/kf_s4_flight_seed7_errors.png),
+[seed 73 top view](../docs/figures/a2/kf_s4_flight_seed73_track.png),
+[seed 73 errors](../docs/figures/a2/kf_s4_flight_seed73_errors.png).
+`evaluate.py` prints the flight rows of the table when the bag contains `/lrs_estimated_flight/reference`.
 
 ## Tests
 

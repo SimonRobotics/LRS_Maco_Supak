@@ -7,6 +7,25 @@ Assignment 1 in one ROS 2 node ([src/lrs_mission_node.cpp](src/lrs_mission_node.
 | A1.1 | `map.pcd` → `pcl::VoxelGrid` downsample → dense 3D occupancy grid → racks filled → 3D inflation → A\* → line-of-sight shortcutting |
 | A1.2 | indoor mission from a CSV: `takeoff`, `land`, `landtakeoff`, `yawN`, `hard` / `soft` precision |
 | A1.3 | outdoor mission: GPS + compass, POI-locked square, figure-8 with tangent heading, return, land, abort |
+| A2 §4 | [`estimated_flight_node`](src/estimated_flight_node.cpp): the §4 route flown on our Kalman-filter estimate only — see below |
+
+## A2 §4: flight on the estimated localisation
+
+A separate executable, not a mode of `lrs_mission_node`. That node always subscribes to the
+MAVROS pose, which §4 forbids as feedback. `estimated_flight_node` subscribes only to
+`/lrs_localization/odom` and `/mavros/state`, and uses the MAVROS mode/arming/takeoff/land
+services and velocity setpoints on `/mavros/setpoint_raw/local`.
+
+```bash
+ros2 launch lrs_mission estimated.launch.py     # starts the estimator (lrs_localization) + this node
+```
+
+Parameters: [config/estimated.yaml](config/estimated.yaml). Design, equations and the three
+recorded flights: [lrs_localization/README.md §4](../lrs_localization/README.md#4-flight-using-estimated-localisation).
+
+When `lrs_mission_node` is used with the A2 localisation world (only to move the drone for
+recordings), run it with `-p use_sim_time:=true`. Its sliding setpoint advances with `now()`, and
+in wall time it flew 2 m/s whenever Gazebo ran below real time.
 
 ## Build
 

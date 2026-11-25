@@ -13,6 +13,10 @@ Prints RMS errors of the estimate and of raw GPS, the share of samples inside th
 IMU > 0.2 s) and GPS outliers as fixes more than 4 m from the truth. Both are marked in the
 plots, and for each one the script prints the error during the outage, the estimate's step
 when the sensor returns (continuity) and whether an outlier moved the estimate.
+
+§4: if the bag has /lrs_estimated_flight/reference, it also prints how far the estimate (the
+controller's feedback) and the truth (the real drone) were from the commanded path, the flight
+time and where the drone landed relative to its takeoff point.
 """
 
 import argparse
@@ -30,6 +34,7 @@ from rosidl_runtime_py.utilities import get_message  # noqa: E402
 EST, TRUTH, GPS = '/lrs_localization/odom', '/evaluation/ground_truth', '/localization/gps'
 STATE, IMU = '/lrs_localization/state', '/localization/imu'  # optional: bias plot
 VO = '/localization/vo'  # optional: VO outages
+REF = '/lrs_estimated_flight/reference'  # optional (§4 flight): the controller's reference
 TIMEOUT = {GPS: 1.0, VO: 0.5, IMU: 0.2}  # the estimator's timeouts [s]
 OUTLIER_M = 4.0  # a GPS fix this far from the truth is an injected outlier (sigma 0.6 / 0.9 m)
 
@@ -66,7 +71,7 @@ def main():
     ap.add_argument('--name', default=None)
     a = ap.parse_args()
     name = a.name or os.path.basename(os.path.normpath(a.bag))
-    d = read_bag(a.bag, (EST, TRUTH, GPS, STATE, IMU, VO))
+    d = read_bag(a.bag, (EST, TRUTH, GPS, STATE, IMU, VO, REF))
     if not d[EST] or not d[TRUTH]:
         raise SystemExit(f'{a.bag}: needs {EST} and {TRUTH}')
 
@@ -183,8 +188,39 @@ def main():
         for to in outliers:
             axis.axvline(to - t0, color='tab:red', ls=':', lw=1.2)
 
+    # §4: how well the real drone (truth) followed the controller's reference, and where it landed.
+    pr = None
+    if d[REF]:
+        ref = sorted(d[REF], key=stamp)
+        tr_ = np.array([stamp(m) for m in ref])
+        pr = np.array([[m.point.x, m.point.y, m.point.z] for m in ref])
+        ok = (tr_ >= tt[0]) & (tr_ <= tt[-1])
+        trk = pr[ok] - np.column_stack([np.interp(tr_[ok], tt, pt_all[:, k]) for k in range(3)])
+        th = np.hypot(trk[:, 0], trk[:, 1])
+        # Distance from the flown path (truth) to the commanded path: the reference trace is
+        # dense (20 Hz at 0.5 m/s = 2.5 cm), so the nearest reference point is the cross-track error.
+        # Truth vs reference at the same instant would also count the ~1 s lag along the route.
+        fly = (tt >= tr_[0]) & (tt <= tr_[-1])
+        ct = np.array([np.min(np.hypot(pr[:, 0] - x, pr[:, 1] - y)) for x, y in pt_all[fly, :2][::10]])
+        # The same for the estimate: how well the controller kept ITS feedback on the path.
+        fe = (te >= tr_[0]) & (te <= tr_[-1])
+        ce = np.array([np.min(np.hypot(pr[:, 0] - x, pr[:, 1] - y)) for x, y in pe[fe, :2][::10]])
+        print(f'controller: estimate off the commanded path RMS {np.sqrt(np.mean(ce ** 2)):.2f} m, max {ce.max():.2f} m')
+        print(f'flight (reference {tr_[-1] - tr_[0]:.0f} s): truth off the commanded path RMS {np.sqrt(np.mean(ct ** 2)):.2f} m, '
+              f'max {ct.max():.2f} m; truth vs reference at the same time RMS {np.sqrt(np.mean(th ** 2)):.2f} m '
+              f'(includes lag along the route); height RMS {np.sqrt(np.mean(trk[:, 2] ** 2)):.2f} m')
+        z = pt_all[:, 2]
+        air = np.flatnonzero(z > z[0] + 0.3)
+        if len(air):
+            start, end = pt_all[air[0]], pt_all[-1]
+            print(f'truth: airborne {tt[air[0]] - t0:.1f}-{tt[air[-1]] - t0:.1f} s ({tt[air[-1]] - tt[air[0]]:.0f} s); '
+                  f'landed {np.hypot(*(end - start)[:2]):.2f} m from the takeoff point; '
+                  f'max height {z.max() - z[0]:.2f} m')
+
     os.makedirs(a.out, exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 7))
+    if pr is not None:
+        ax.plot(pr[:, 0], pr[:, 1], 'k--', lw=1, label='controller reference')
     if d[GPS]:
         ax.plot(pg[:, 0], pg[:, 1], '.', color='tab:blue', ms=3, alpha=.5, label='raw GPS')
     ax.plot(pt_all[:, 0], pt_all[:, 1], 'g-', lw=2.5, label='truth (evaluation only)')
