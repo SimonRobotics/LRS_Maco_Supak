@@ -8,7 +8,7 @@ that fuses noisy GPS, drifting visual odometry and a biased yaw gyro.
 |---|---|
 | §1 Sensor acquisition and characterisation | done — [characterisation](../docs/a2_charakterizacia_senzorov.md) |
 | §2 Eight-state KF/EKF | done — prediction, GPS, VO body velocity (EKF), zero-rate/zero-velocity updates |
-| §3 Missing and bad measurements | – |
+| §3 Missing and bad measurements | done — innovation gate, timeouts, gyro-less prediction, recovery from permanent rejection |
 | §4 Flight using estimated localisation | – |
 
 ## Build
@@ -76,8 +76,27 @@ estimate and its 2σ ellipse, the last GPS fixes and VO; on the right the x/y an
 the estimate against the filter's own 2σ and the gyro bias estimate. Times are header stamps.
 
 [`evaluate.py`](scripts/evaluate.py) is an offline evaluation tool: it is the only place besides
-[`characterise.py`](scripts/characterise.py) that reads `/evaluation/ground_truth`, and it sends
-nothing back.
+[`characterise.py`](scripts/characterise.py) and [`live_plot.py`](scripts/live_plot.py) that reads
+`/evaluation/ground_truth`, and it sends nothing back.
+
+### Outage and outlier tests (§3)
+
+```bash
+# live, during a flight: the assignment's services, timed in simulation time (see §3)
+python3 lrs_localization/scripts/teacher_tests.py
+
+# offline, repeatable: the same faults cut into a recorded bag, then replayed
+python3 lrs_localization/scripts/degrade_bag.py bags/a2_flight_seed42 /tmp/deg \
+    --gps-outlier 20 --gps-off 40:55 --gps-outlier 45 --vo-off 70:73 --gps-outlier 85
+lrs_localization/scripts/replay.sh /tmp/deg /tmp/deg_replay
+python3 lrs_localization/scripts/evaluate.py /tmp/deg_replay --out /tmp/figures
+```
+
+[`degrade_bag.py`](scripts/degrade_bag.py) mimics the simulator: an outlier requested during a GPS
+outage lands on the first fix after it. It can also cut the IMU (`--imu-off`) and shift GPS
+permanently (`--gps-shift`), which the teacher services cannot. `evaluate.py` finds outages from
+gaps in the recorded stamps and outliers from the truth, shades them in the plots and prints the
+error during each outage and the estimate's largest step when the sensor returns.
 
 ## §1 Sensor acquisition
 
@@ -286,6 +305,166 @@ slightly worse short flight.
 ![Flight, seed 42](../docs/figures/a2/kf_vo_vel_errors.png)
 ![8 min idle then flight, seed 7](../docs/figures/a2/kf_long_idle_errors.png)
 
+## §3 Missing and bad measurements
+
+Nothing is ever reset because a sensor is missing or wrong. The prediction carries the state,
+and the covariance `P` grows by exactly what the process model says it should.
+
+### Innovation gate
+
+Before any gain is computed, every GPS fix and every VO velocity is tested
+([`ekf.hpp`](include/lrs_localization/ekf.hpp), `Ekf8::update`):
+
+```text
+r   = z - h(x)                       innovation
+S   = H P H^T + R                    its covariance if the filter and the sensor are right
+NIS = r^T S^-1 r                     (solved with LDLT, no inverse)
+NIS > gate  ->  rejected, x and P unchanged
+```
+
+If the measurement is correct and the filter consistent, `r ~ N(0, S)` and NIS is chi-square
+distributed with 3 degrees of freedom. `gps_gate_nis = 16.27` is its 99.9 % quantile: a correct
+fix is rejected with probability 0.1 %, about one per 200 s at 5 Hz. Measured on the fault-free bags:
+1 of ~550 fixes (seed 42) and 2–3 of ~2,900 (seed 7) were rejected, as predicted. A higher gate
+lets in more of the outlier's tail, a lower one throws away good fixes.
+
+Because `S` contains `H P H^T`, the gate is **not a fixed distance**: it widens while `P` grows.
+The same 6 m innovation is rejected by a converged filter (NIS 97) and accepted after 15 s of pure
+prediction (position σ 17 m, NIS 0.13) — test `GateIsStatisticalNotAFixedDistance`.
+
+**The outlier after the outage.** The simulator applies an outlier requested during a GPS outage
+to the *first* fix after GPS returns, exactly when `P` is largest. The gate still rejects it
+because VO body velocity keeps fusing during the GPS outage: the velocity stays known, and the
+position σ only grows from ~0.10 to ~0.2 m in 15 s. A 5 m outlier along z, the hardest direction,
+is still `5 / sqrt(0.2² + 0.9²) ≈ 5.4 σ` out (test `OutlierRightAfterFifteenSecondGpsOutageIsRejected`).
+With GPS **and** VO both lost for 15 s, σ would reach ~17 m and the outlier would pass the gate. The
+assignment does not test that case, and nothing could distinguish such an outlier from a true fix then.
+
+A rejected fix is logged with everything needed to explain it at the defence:
+
+```text
+[gps] REJECTED fix at t=40.09: innovation (-3.08, -5.83, +2.16) m, |r| 6.94 m; expected innovation sigma
+(0.61, 0.61, 0.91) m -> NIS 122.9 > gate 16.27 (chi-square, 3 dof). A correct fix is this far out with
+probability 1.8e-26, so it is treated as an outlier; filter unchanged [1 in a row]
+```
+
+The probability is the chi-square survival function (closed form for 3 dof:
+`erfc(sqrt(x/2)) + sqrt(2x/π) e^(-x/2)`, `chi2Survival` in `ekf.hpp`).
+
+VO velocity has the same gate (`vo_gate_nis`). In flight its NIS averages 0.3, because `R` is
+deliberately wide (§2), so it never fired on the recorded flights. It is there for a VO glitch.
+VO rejections are logged throttled (up to 10/s), and the count is in the `[filter]` report.
+
+### Recovery from permanent rejection
+
+The gate assumes the filter is right. If the filter is wrong (overconfident after a long outage,
+or GPS has jumped for good), every fix fails and the filter would never recover.
+[`rejection_guard.hpp`](include/lrs_localization/rejection_guard.hpp):
+
+- `gps_max_rejections` = 10 rejected fixes **in a row** (2 s) → RECOVERY. The GPS agrees with
+  itself but not with the filter, so the filter is presumed wrong.
+- In recovery, a fix outside the gate is applied with `R` scaled by `α ≥ 1`, chosen so that
+  `r^T (H P H^T + α R)^-1 r = gate` (NIS(α) falls monotonically in α, so α is found by bisection).
+  The filter takes the step a borderline-acceptable fix would cause: towards GPS, bounded, never
+  a jump onto one raw fix. Fixes inside the gate are applied normally.
+- Recovery ends when 10 fixes in a row pass the gate on their own. Ending at the first passing
+  fix would flip back and forth while the residual is still ~2 m.
+
+A single outlier is one rejection, and the next good fix resets the count, so it can never
+start recovery. Replay with GPS shifted permanently by (4, −3) m (`--gps-shift`): 10 rejections,
+then 42 inflated fixes. The estimate moved onto the shifted GPS in ~15 s with no step larger
+than 9.4 cm, and recovery ended on its own.
+
+### Sensor timeouts
+
+`SensorChannel::checkTimeout` measures silence in **header stamps**: "now" is the newest stamp of
+any sensor, so a slow simulation does not cause false timeouts.
+
+| Sensor | Timeout | Missed samples | While out |
+|---|---:|---:|---|
+| GPS | 1.0 s | 5 | position from prediction + VO velocity; σ grows |
+| VO | 0.5 s | 15 | velocity from GPS + constant-velocity model |
+| IMU | 0.2 s | 20 | predict with `w = b` (no turn), extra yaw noise; output published on GPS/VO messages |
+
+Each transition is logged once (`TIMEOUT`, `RECOVERED`). The first GPS fix after an outage
+reports the outage length, the σ before it, its innovation and the gate's decision:
+
+```text
+[gps] TIMEOUT: no message since t=44.89 (1.01 s > 1.00 s) -- position carried by prediction + VO velocity, sigma grows
+[gps] RECOVERED after 15.2 s outage: sigma before the fix xy 0.19 m, z 0.18 m | innovation (+0.88, +3.70, +4.09) m,
+|r| 5.58 m, NIS 56.11 (gate 16.27) -> REJECTED (see below)
+[vo] RECOVERED after 3.0 s tracking loss: velocity innovation |r| 0.331 m/s, NIS 0.40 (gate 16.27) -> accepted
+```
+
+**IMU loss.** The gyro drives both the prediction and the publishing, so without it the output
+would stop. During an IMU timeout the node predicts with `w = b` (true yaw rate 0) and adds
+`imu_lost_yaw_rate_std²` = 1.0 rad²/s to the yaw noise density (`Ekf8::predictTo(t, w, extra_q_yaw)`).
+It publishes after every GPS and VO message instead (30 Hz). 1.0 rad/s is the A1 mission's
+largest yaw rate (1.07 rad/s measured). With 0.2 rad/s, a 2 s IMU loss in a 180° turn claimed a yaw σ of 15° while the true
+error was 62°. With 1.0, the claimed σ was 57° and the true error 25°: the honest σ lets the
+GPS/VO motion coupling (§2) correct the heading during the loss (yaw RMS of that run 11.3° → 4.7°).
+
+### Results
+
+Regression, no faults (replay; §2 numbers re-measured on the same commit before the gate):
+
+| | horizontal | z | yaw | GPS fixes rejected |
+|---|---:|---:|---:|---:|
+| flight seed 42, before §3 → with §3 | 0.151 → 0.147 m | 0.144 → 0.142 m | 0.79 → 0.80° | 1 of ~550 |
+| 8 min idle + flight seed 7 | 0.129 → 0.130 m | 0.155 → 0.154 m | 1.60 → 1.80° | 2–3 of ~2,900 |
+
+The seed 7 yaw varies by ±0.2° between replays even with identical code, because the arrival order
+of the messages differs; the gate does not change the accuracy. (These replays give
+somewhat better numbers than the §2 table above, 0.15 m instead of 0.17 m on seed 42. The code is
+the same, so the §2 table was measured on an earlier replay setup.)
+
+The assignment's test: outlier in flight, GPS off for 15 s with an outlier requested during the
+outage, VO off for 3 s. **Live** = flown by the A1 node (`missions/a2_rectangle.csv`,
+`max_speed:=0.5`) with the services called by `teacher_tests.py`, recorded in
+[`bags/a2_s3_outages_seed42`](../bags/a2_s3_outages_seed42) (sensors, truth, estimate, `/rosout`).
+**Replay** = the same faults cut into the recorded flights with `degrade_bag.py`.
+
+| | live, seed 42 | replay, seed 42 | replay, seed 7 (8 min idle) |
+|---|---:|---:|---:|
+| outlier in flight: \|r\|, NIS → | 6.9 m, 123 → rejected | 7.7 m, 156 → rejected | 6.9 m, 98 → rejected |
+| outlier on the first fix after the 15 s outage | 5.6 m, 56 → rejected | 6.6 m, 102 → rejected | 7.9 m, 147 → rejected |
+| σ xy just before that fix | 0.19 m | 0.19 m | 0.22 m |
+| error at the end of the GPS outage (filter 2σ) | 0.13 m (0.55) | 0.11 m (0.54) | 0.14 m (0.62) |
+| largest estimate step within 1 s of GPS return | 11 cm | 10 cm | 23 cm |
+| largest error during the 3 s VO outage (2σ at return) | 0.53 m (1.08) | 0.61 m (1.15) | 0.74 m (1.15) |
+| whole run: RMS horizontal / z / yaw | 0.16 m / 0.17 m / 1.0° | 0.17 m / 0.18 m / 0.6° | 0.14 m / 0.16 m / 1.9° |
+| inside own 2σ (x, y, z, yaw) | 100, 93, 98, 100 % | 98, 98, 85, 100 % | 96, 100, 86, 96 % |
+
+- **GPS outage**: VO velocity carries the position. The error stays below 0.2 m for 15 s, well
+  inside the filter's 2σ, and the first good fix moves the estimate by about 10 cm.
+- **VO outage**: the filter becomes GPS + constant velocity. Velocity is then known only from noisy GPS, so
+  σ grows to ~0.55 m within 3 s and each fix moves the estimate by up to ~0.5 m (largest step
+  at 100 Hz: 51 cm live). The truth stays inside 2σ, and after VO returns σ shrinks back within a
+  few seconds. This is the Kalman gain doing what `q_acc_xy` = 0.25 (chosen in §2 for the turns)
+  implies. §4 limits the commanded speed, so these steps cannot become a velocity spike.
+- **Outliers**: no visible step. Within 0.5 s of an outlier the largest step is 2–10 cm, which is
+  an ordinary fix. The 23 cm in the seed 7 column is the first *good* fix after the outage, 0.2 s later.
+
+The A1 node must run with `use_sim_time:=true`: its setpoint carrot advances with `now()`, and in
+wall time it moved at 0.5 m/s *wall*. In a first live run Gazebo ran at ~0.3× real time, so
+the drone flew at 2 m/s. The estimator still tracked it (0.16 m), but that is not the specified
+flight, so it was re-recorded.
+
+![Live flight with outages, seed 42](../docs/figures/a2/kf_s3_live_errors.png)
+![Live flight, top view](../docs/figures/a2/kf_s3_live_track.png)
+
+Replays: [seed 42](../docs/figures/a2/kf_s3_replay_seed42_errors.png),
+[seed 7](../docs/figures/a2/kf_s3_replay_seed7_errors.png).
+
+| Parameter | Value | Why |
+|---|---|---|
+| `gps_gate_nis` | 16.27 | chi-square 3 dof, 99.9 %: 0.1 % of good fixes lost; the 5–8 m outliers measured NIS 56–170 |
+| `vo_gate_nis` | 16.27 | same test for the 3-D VO velocity |
+| `gps_max_rejections` | 10 (2 s) | 10 false rejections in a row: probability 10⁻³⁰; one outlier = 1 |
+| `vo_max_rejections` | 10 (1 s) | |
+| `gps_timeout_s`, `vo_timeout_s`, `imu_timeout_s` | 1.0, 0.5, 0.2 s | 5 / 15 / 20 missed samples, logs only (IMU: also switches the prediction) |
+| `imu_lost_yaw_rate_std` | 1.0 rad/s | largest yaw rate of the mission |
+
 ## Tests
 
 ```bash
@@ -300,4 +479,13 @@ colcon test --packages-select lrs_localization && colcon test-result --verbose
   bias is observable from yaw updates, the body-velocity Jacobian equals the numerical
   derivative, body velocity is rotated into ENU, **a 20° heading error is corrected from motion
   alone** (GPS + VO velocity, no yaw measurement), a zero-velocity update stops a creeping
-  estimate, and zero-rate updates estimate the bias.
+  estimate, and zero-rate updates estimate the bias;
+- §3 ([`test_ekf.cpp`](test/test_ekf.cpp), [`test_sensor_channel.cpp`](test/test_sensor_channel.cpp)):
+  chi-square survival against tables, **a GPS outlier is rejected and x, P stay bit-identical**,
+  **the gate is statistical** (the same 6 m innovation rejected with small P, accepted after 15 s of
+  prediction), **the outlier on the first fix after a 15 s GPS outage with VO is still rejected**
+  (all three axes) while a normal fix is accepted, the inflated update hits NIS = gate exactly and
+  moves only part of the way, prediction without the gyro keeps the yaw and widens it, the
+  rejection guard (one outlier never starts recovery; N in a row does; N passes end it), the
+  15 s prediction stays finite, and timeouts/recoveries are measured in stamps and cleared by
+  a simulation reset.

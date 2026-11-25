@@ -63,3 +63,18 @@ lrs_localization:
 
     # --- logging
     report_period_s: 5.0       # [s] period of the "[sensors]" and "[filter]" summaries
+
+    # --- §3 missing and bad measurements
+    gps_gate_nis: 16.27        # NIS gate for GPS: chi-square, 3 dof, 99.9 % -- a correct fix is rejected
+                               #   with probability 0.1 % (one per ~200 s at 5 Hz); the 5-8 m outlier has NIS > 30
+    gps_max_rejections: 10     # after this many rejected fixes in a row (2 s) the filter is presumed wrong:
+                               #   fixes outside the gate are then applied with R inflated so that NIS = gate,
+                               #   until as many in a row pass on their own (0 = reject forever). One outlier
+                               #   is one rejection, the next good fix resets the count.
+    vo_gate_nis: 16.27         # same gate for the VO body velocity (3 dof)
+    vo_max_rejections: 10      # at 10 Hz = 1 s
+    gps_timeout_s: 1.0         # [s, header stamps] TIMEOUT/RECOVERED log; 5 missed fixes
+    vo_timeout_s: 0.5          # [s] 15 missed VO samples
+    imu_timeout_s: 0.2         # [s] 20 missed gyro samples; then predict with w = b (no turn) ...
+    imu_lost_yaw_rate_std: 1.0 # [rad/s] ... and this yaw-rate uncertainty: the A1 mission turns at up to 1.07 rad/s.
+                               #   0.2 claimed yaw sigma 15 deg after a 2 s loss in a turn, true error 62 deg

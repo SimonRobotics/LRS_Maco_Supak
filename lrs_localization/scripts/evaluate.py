@@ -8,6 +8,11 @@ Reads a bag with /lrs_localization/odom, /evaluation/ground_truth and (optionall
 
 Prints RMS errors of the estimate and of raw GPS, the share of samples inside the filter's own
 2 sigma (about 95 % for a consistent filter), and saves <name>_track.png and <name>_errors.png.
+
+§3: sensor outages are found from gaps in the recorded header stamps (GPS > 1 s, VO > 0.5 s,
+IMU > 0.2 s) and GPS outliers as fixes more than 4 m from the truth. Both are marked in the
+plots, and for each one the script prints the error during the outage, the estimate's step
+when the sensor returns (continuity) and whether an outlier moved the estimate.
 """
 
 import argparse
@@ -24,6 +29,9 @@ from rosidl_runtime_py.utilities import get_message  # noqa: E402
 
 EST, TRUTH, GPS = '/lrs_localization/odom', '/evaluation/ground_truth', '/localization/gps'
 STATE, IMU = '/lrs_localization/state', '/localization/imu'  # optional: bias plot
+VO = '/localization/vo'  # optional: VO outages
+TIMEOUT = {GPS: 1.0, VO: 0.5, IMU: 0.2}  # the estimator's timeouts [s]
+OUTLIER_M = 4.0  # a GPS fix this far from the truth is an injected outlier (sigma 0.6 / 0.9 m)
 
 
 def read_bag(path, topics):
@@ -58,7 +66,7 @@ def main():
     ap.add_argument('--name', default=None)
     a = ap.parse_args()
     name = a.name or os.path.basename(os.path.normpath(a.bag))
-    d = read_bag(a.bag, (EST, TRUTH, GPS, STATE, IMU))
+    d = read_bag(a.bag, (EST, TRUTH, GPS, STATE, IMU, VO))
     if not d[EST] or not d[TRUTH]:
         raise SystemExit(f'{a.bag}: needs {EST} and {TRUTH}')
 
@@ -124,12 +132,70 @@ def main():
         print(f'gyro bias: estimate {b_est[-1]:+.4f} ± {b_sig[-1]:.4f} rad/s (1σ)'
               + (f', true {b_true:+.4f} rad/s' if b_true is not None else ''))
 
+    # §3: outages from gaps in the sensor stamps, outliers from the truth.
+    outages = {}
+    for topic in (GPS, VO, IMU):
+        ts = np.sort([stamp(m) for m in d[topic]])
+        gaps = np.flatnonzero(np.diff(ts) > TIMEOUT[topic]) if len(ts) > 1 else []
+        outages[topic] = [(ts[i], ts[i + 1]) for i in gaps]
+    outliers = []
+    if d[GPS]:
+        outliers = [tg[i] for i in np.flatnonzero(np.linalg.norm(eg, axis=1) > OUTLIER_M)]
+    step = np.r_[0.0, np.linalg.norm(np.diff(pe, axis=0), axis=1)]  # estimate step per sample
+    yaw_step = np.r_[0.0, np.abs(wrap(np.diff(ye)))]
+    eh = np.hypot(ep[:, 0], ep[:, 1])
+    sh = np.hypot(sp[:, 0], sp[:, 1])
+
+    def near(t, before=0.0, after=1.0):
+        return (te >= t - before) & (te <= t + after)
+
+    if any(outages.values()) or outliers:
+        quiet = te > te[0] + 5.0  # not the initial convergence from the first GPS fixes
+        for lst in outages.values():
+            for lo, hi in lst:
+                quiet &= ~near(hi, 0.0, 1.0)
+        print(f'largest estimate step outside outage returns: {step[quiet].max() * 100:.1f} cm '
+              f'(99th percentile {np.percentile(step[quiet], 99) * 100:.1f} cm)')
+    for topic, lst in outages.items():
+        for lo, hi in lst:
+            inside = (te > lo) & (te < hi)
+            ret = near(hi, 0.0, 1.0)
+            k_end = max(np.searchsorted(te, hi) - 1, 0)
+            msg = (f'{topic.split("/")[-1].upper()} outage {lo - t0:6.1f}-{hi - t0:6.1f} s ({hi - lo:4.1f} s): '
+                   f'max horiz error {eh[inside].max() if inside.any() else 0:.2f} m, '
+                   f'at return {eh[k_end]:.2f} m vs filter 2 sigma {2 * sh[k_end]:.2f} m, '
+                   f'max yaw error {np.degrees(np.abs(ey[inside]).max()) if inside.any() else 0:.1f} deg; '
+                   f'largest step in the 1 s after return {step[ret].max() * 100:.1f} cm, '
+                   f'yaw {np.degrees(yaw_step[ret].max()):.2f} deg')
+            print(msg)
+    for to in outliers:
+        k = np.searchsorted(te, to)
+        win = near(to, 0.0, 0.5)
+        print(f'GPS outlier at {to - t0:6.1f} s: fix {np.linalg.norm(eg[np.searchsorted(tg, to)]):.1f} m off; '
+              f'estimate error before {eh[max(k - 1, 0)]:.2f} m, max in the next 0.5 s {eh[win].max():.2f} m, '
+              f'largest step {step[win].max() * 100:.1f} cm')
+
+    def mark(axis):
+        colors = {GPS: 'tab:red', VO: 'tab:purple', IMU: 'tab:brown'}
+        for topic, lst in outages.items():
+            for lo, hi in lst:
+                axis.axvspan(lo - t0, hi - t0, color=colors[topic], alpha=.12, lw=0)
+        for to in outliers:
+            axis.axvline(to - t0, color='tab:red', ls=':', lw=1.2)
+
     os.makedirs(a.out, exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 7))
     if d[GPS]:
         ax.plot(pg[:, 0], pg[:, 1], '.', color='tab:blue', ms=3, alpha=.5, label='raw GPS')
     ax.plot(pt_all[:, 0], pt_all[:, 1], 'g-', lw=2.5, label='truth (evaluation only)')
     ax.plot(pe[:, 0], pe[:, 1], color='tab:orange', lw=1.2, label='estimate')
+    if outliers:
+        po = pg[[np.searchsorted(tg, to) for to in outliers]]
+        ax.plot(po[:, 0], po[:, 1], 'rx', ms=10, mew=2, label='GPS outlier (rejected?)')
+    for lo, hi in outages[GPS]:
+        seg = (te > lo) & (te < hi)
+        ax.plot(pe[seg, 0], pe[seg, 1], color='tab:red', lw=2.5,
+                label='estimate during GPS outage' if lo == outages[GPS][0][0] else None)
     ax.set(xlabel='x ENU [m]', ylabel='y ENU [m]', title=f'{name}: top view')
     ax.axis('equal')
     ax.legend()
@@ -165,6 +231,16 @@ def main():
         ax[5].set_ylim(min(-0.05, (b_true or 0) - 0.02), max(0.05, (b_true or 0) + 0.02))
         ax[5].legend(loc='upper right')
         ax[5].grid(alpha=.3)
+    for axis in ax:
+        mark(axis)
+    if any(outages.values()) or outliers:
+        from matplotlib.patches import Patch
+        from matplotlib.lines import Line2D
+        handles = [Patch(color=c, alpha=.25, label=f'{n} outage') for n, c, tp in
+                   (('GPS', 'tab:red', GPS), ('VO', 'tab:purple', VO), ('IMU', 'tab:brown', IMU)) if outages[tp]]
+        if outliers:
+            handles.append(Line2D([], [], color='tab:red', ls=':', label='GPS outlier'))
+        ax[3].legend(handles=handles, loc='upper right')
     fig.suptitle(f'{name}: estimate minus truth with the filter\'s own 2σ')
     fig.tight_layout()
     fig.savefig(os.path.join(a.out, f'{name}_errors.png'), dpi=110)

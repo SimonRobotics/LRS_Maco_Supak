@@ -21,9 +21,24 @@
 //   zero-rate / zero-velocity (1 Hz)  only while standing still: b = mean gyro, v = 0
 //   VO yaw                            off by default (it drifts); vo_yaw_mode absolute to compare
 //
+// §3 Missing and bad measurements:
+//   - GPS and VO velocity pass an innovation gate (NIS = r^T S^-1 r against a chi-square
+//     threshold, ekf.hpp). A rejected GPS fix is logged with its innovation, NIS and the
+//     probability that a correct fix lies that far out. After gps_max_rejections rejections in
+//     a row the filter itself is presumed wrong (rejection_guard.hpp): fixes are then applied
+//     with R inflated so that NIS = gate -- a bounded step, never a jump onto one raw
+//     measurement -- until as many fixes in a row pass the gate again.
+//   - Each sensor has a timeout in header-stamp time (GPS 1 s, VO 0.5 s, IMU 0.2 s). TIMEOUT
+//     and RECOVERED transitions are logged once each; on GPS return the log shows the outage
+//     length, the sigma before the fix, its innovation and whether it was accepted.
+//   - Without the IMU the filter predicts with w = b (no turn) and a larger yaw noise, and the
+//     estimate is published after GPS/VO messages instead -- the output does not stop.
+//   Nothing is ever reset because of an outage; prediction simply carries the state.
+//
 // Threading: all callbacks share the filter state, so they must run one at a time. The node
 // is spun by a SingleThreadedExecutor, which guarantees that without any locks.
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <sstream>
@@ -32,6 +47,7 @@
 
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "lrs_localization/ekf.hpp"
+#include "lrs_localization/rejection_guard.hpp"
 #include "lrs_localization/sensor_channel.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -95,6 +111,9 @@ public:
   {
     const double reset_jump = declare_parameter("reset_jump_s", 1.0);
     for (auto * ch : {&gps_, &vo_, &imu_}) {ch->setResetJump(reset_jump);}
+    gps_.setTimeout(declare_parameter("gps_timeout_s", 1.0));
+    vo_.setTimeout(declare_parameter("vo_timeout_s", 0.5));
+    imu_.setTimeout(declare_parameter("imu_timeout_s", 0.2));
     const double report_period = declare_parameter("report_period_s", 5.0);
 
     // --- filter parameters
@@ -133,6 +152,13 @@ public:
     zaru_slack_ = declare_parameter("zaru_slack", 0.001);
     zupt_enabled_ = declare_parameter("zupt_enabled", true);
     zupt_std_ = declare_parameter("zupt_std", 0.02);
+    // §3 gates and outage handling
+    gps_gate_nis_ = declare_parameter("gps_gate_nis", 16.27);
+    gps_guard_ = lrs_localization::RejectionGuard(declare_parameter("gps_max_rejections", 10));
+    vo_gate_nis_ = declare_parameter("vo_gate_nis", 16.27);
+    vo_guard_ = lrs_localization::RejectionGuard(declare_parameter("vo_max_rejections", 10));
+    const double imu_lost_rate_std = declare_parameter("imu_lost_yaw_rate_std", 1.0);
+    imu_lost_q_yaw_ = imu_lost_rate_std * imu_lost_rate_std;
 
     odom_frame_ = declare_parameter("odom_frame", std::string("map"));
     base_frame_ = declare_parameter("base_frame", std::string("base_link"));
@@ -173,6 +199,15 @@ private:
   {
     const double t = toSec(m.header.stamp);
     if (!accept(imu_, t, m.header.frame_id)) {return;}
+    if (const double gap = imu_.takeRecoveredGap(); gap > 0.0) {
+      RCLCPP_INFO(
+        get_logger(), "[imu] RECOVERED after %.2f s without gyro: yaw sigma %.1f deg -- gyro prediction resumes",
+        gap, ekf_.initialized() ? std::sqrt(ekf_.P()(idx::kYaw, idx::kYaw)) * 180.0 / M_PI : 0.0);
+      zaru_n_ = 0;  // the stillness window would span the outage
+      zaru_sum_ = zaru_sumsq_ = 0.0;
+      zaru_vo_sum_.setZero();
+      zaru_vo_n_ = 0;
+    }
     imu_wz_sum_ += m.angular_velocity.z;
     ++imu_wz_n_;
     last_wz_ = m.angular_velocity.z;
@@ -237,14 +272,69 @@ private:
       initialize(t, z, R);
       return;
     }
+    const double outage = gps_.takeRecoveredGap();
     if (!bringTo(gps_, t)) {return;}
-    const auto res = ekf_.updatePosition(z, R);
+    const StateCov P_before = ekf_.P();
+
+    lrs_localization::Gate gate;
+    gate.nis = gps_gate_nis_;
+    gate.inflate = gps_guard_.recovering();
+    const auto res = ekf_.updatePosition(z, R, gate);
+    const Eigen::Vector3d r = res.innovation;
+
+    if (outage > 0.0) {
+      RCLCPP_INFO(
+        get_logger(),
+        "[gps] RECOVERED after %.1f s outage: sigma before the fix xy %.2f m, z %.2f m | innovation "
+        "(%+.2f, %+.2f, %+.2f) m, |r| %.2f m, NIS %.2f (gate %.2f) -> %s",
+        outage, std::sqrt(0.5 * (P_before(idx::kPx, idx::kPx) + P_before(idx::kPy, idx::kPy))),
+        std::sqrt(P_before(idx::kPz, idx::kPz)), r.x(), r.y(), r.z(), r.norm(), res.nis, gps_gate_nis_,
+        res.rejected ? "REJECTED (see below)" : (res.applied ? "accepted" : "not applied (non-finite)"));
+    }
+
+    if (res.rejected) {
+      const auto ev = gps_guard_.onRejected();
+      ++gps_rejected_total_;
+      const Eigen::Vector3d sig = res.S.diagonal().cwiseSqrt();
+      RCLCPP_WARN(
+        get_logger(),
+        "[gps] REJECTED fix at t=%.2f: innovation (%+.2f, %+.2f, %+.2f) m, |r| %.2f m; expected "
+        "innovation sigma (%.2f, %.2f, %.2f) m -> NIS %.1f > gate %.2f (chi-square, 3 dof). A correct "
+        "fix is this far out with probability %.1e, so it is treated as an outlier; filter unchanged "
+        "[%d in a row]",
+        t, r.x(), r.y(), r.z(), r.norm(), sig.x(), sig.y(), sig.z(), res.nis, gps_gate_nis_,
+        lrs_localization::chi2Survival(res.nis, 3), gps_guard_.rejectedInRow());
+      if (ev == lrs_localization::RejectionGuard::Event::kEnterRecovery) {
+        // The GPS agrees with itself but not with the filter, so the filter is the one that is
+        // wrong: from now on fixes outside the gate are applied with R * alpha so NIS = gate,
+        // and the estimate walks towards GPS over several fixes.
+        RCLCPP_WARN(
+          get_logger(),
+          "[gps] %d fixes rejected in a row -- the filter is presumed wrong, not the GPS: RECOVERY, "
+          "next fixes are applied with R inflated so that NIS = gate", gps_guard_.rejectedInRow());
+      }
+      return;
+    }
     if (!res.applied) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "[gps] update produced non-finite values, skipped");
       return;
     }
+    if (res.r_scale > 1.0) {
+      if (gps_guard_.inflatedThisEpisode() == 0) {
+        RCLCPP_WARN(
+          get_logger(), "[gps] recovery: first inflated fix, R x %.1f (NIS was %.1f, |r| %.2f m)",
+          res.r_scale, res.nis, r.norm());
+      }
+      ++gps_inflated_total_;
+    }
+    if (gps_guard_.onApplied(res.r_scale > 1.0) == lrs_localization::RejectionGuard::Event::kLeaveRecovery) {
+      RCLCPP_INFO(
+        get_logger(), "[gps] recovery done: fixes pass the gate on their own again, after %zu inflated updates",
+        gps_guard_.inflatedThisEpisode());
+    }
     gps_nis_sum_ += res.nis;
     ++gps_nis_n_;
+    if (imu_.timedOut()) {publish();}
   }
 
   // VO: the linear twist (velocity in base_link) is fused with the EKF body-velocity update.
@@ -255,6 +345,7 @@ private:
   {
     const double t = toSec(m.header.stamp);
     if (!accept(vo_, t, m.header.frame_id, m.child_frame_id)) {return;}
+    const double outage = vo_.takeRecoveredGap();
     vo_yaw_ = quatYaw(m.pose.pose.orientation);
     have_vo_yaw_ = true;
     const auto & l = m.twist.twist.linear;
@@ -263,9 +354,39 @@ private:
     ++zaru_vo_n_;
     if (!ekf_.initialized()) {return;}
 
-    if (t - last_vo_vel_t_ >= vo_vel_period_ && bringTo(vo_, t)) {
-      const auto res = ekf_.updateBodyVelocity(vb, voVelocityCovariance(m));
-      if (res.applied) {
+    if ((outage > 0.0 || t - last_vo_vel_t_ >= vo_vel_period_) && bringTo(vo_, t)) {
+      lrs_localization::Gate gate;
+      gate.nis = vo_gate_nis_;
+      gate.inflate = vo_guard_.recovering();
+      const auto res = ekf_.updateBodyVelocity(vb, voVelocityCovariance(m), gate);
+      if (outage > 0.0) {
+        RCLCPP_INFO(
+          get_logger(),
+          "[vo] RECOVERED after %.1f s tracking loss: velocity innovation |r| %.3f m/s, NIS %.2f "
+          "(gate %.2f) -> %s",
+          outage, res.innovation.norm(), res.nis, vo_gate_nis_,
+          res.rejected ? "rejected" : (res.applied ? "accepted" : "not applied"));
+      }
+      if (res.rejected) {
+        // Up to 10 per second, so logged throttled; the count is in the [filter] report.
+        const auto ev = vo_guard_.onRejected();
+        ++vo_rejected_total_;
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000,
+          "[vo] velocity REJECTED: innovation |r| %.3f m/s, NIS %.1f > gate %.2f (p = %.1e) [%d in a row]",
+          res.innovation.norm(), res.nis, vo_gate_nis_, lrs_localization::chi2Survival(res.nis, 3),
+          vo_guard_.rejectedInRow());
+        if (ev == lrs_localization::RejectionGuard::Event::kEnterRecovery) {
+          RCLCPP_WARN(
+            get_logger(), "[vo] %d velocities rejected in a row -- RECOVERY: applied with R inflated so that NIS = gate",
+            vo_guard_.rejectedInRow());
+        }
+        last_vo_vel_t_ = t;  // try again one period later, not on the next 30 Hz sample
+      } else if (res.applied) {
+        if (vo_guard_.onApplied(res.r_scale > 1.0) == lrs_localization::RejectionGuard::Event::kLeaveRecovery) {
+          RCLCPP_INFO(
+            get_logger(), "[vo] recovery done after %zu inflated updates", vo_guard_.inflatedThisEpisode());
+        }
         last_vo_vel_t_ = t;
         vo_vel_nis_sum_ += res.nis;
         ++vo_vel_nis_n_;
@@ -281,6 +402,11 @@ private:
         vo_yaw_nis_sum_ += res.nis;
         ++vo_yaw_nis_n_;
       }
+    }
+    // Without the gyro, VO (30 Hz) drives the output instead.
+    if (imu_.timedOut()) {
+      if (t > ekf_.time()) {bringTo(vo_, t);}
+      publish();
     }
   }
 
@@ -329,7 +455,7 @@ private:
   bool bringTo(const SensorChannel & ch, double t)
   {
     if (t > ekf_.time()) {
-      ekf_.predictTo(t, last_wz_);
+      ekf_.predictTo(t, gyroRate(), imu_.timedOut() ? imu_lost_q_yaw_ : 0.0);
       return true;
     }
     const double lag = ekf_.time() - t;
@@ -339,6 +465,27 @@ private:
       get_logger(), *get_clock(), 2000, "[%s] measurement %.3f s older than the filter, dropped",
       ch.name().c_str(), lag);
     return false;
+  }
+
+  // Gyro rate for the prediction. Without the IMU: w = b, i.e. assume the drone does not turn
+  // (yaw stays, its uncertainty grows by imu_lost_yaw_rate_std^2 per second).
+  double gyroRate() const {return imu_.timedOut() ? ekf_.x()(idx::kBias) : last_wz_;}
+
+  // Called with every accepted stamp: the newest stamp of any sensor is "now" in simulation
+  // time; a channel silent for longer than its timeout is reported once.
+  void checkTimeouts(double t)
+  {
+    newest_stamp_ = std::max(newest_stamp_, t);
+    for (auto * ch : {&gps_, &vo_, &imu_}) {
+      if (!ch->checkTimeout(newest_stamp_)) {continue;}
+      const char * consequence =
+        ch == &gps_ ? "position carried by prediction + VO velocity, sigma grows" :
+        ch == &vo_ ? "velocity carried by GPS + motion model" :
+        "predicting with w = b (no turn), yaw sigma grows; output published on GPS/VO";
+      RCLCPP_WARN(
+        get_logger(), "[%s] TIMEOUT: no message since t=%.2f (%.2f s > %.2f s) -- %s",
+        ch->name().c_str(), ch->lastStamp(), newest_stamp_ - ch->lastStamp(), ch->timeout(), consequence);
+    }
   }
 
   // GPS covariance from the message if it is usable, otherwise the configured sigmas.
@@ -387,12 +534,12 @@ private:
     o.twist.twist.linear.x = vb.x();
     o.twist.twist.linear.y = vb.y();
     o.twist.twist.linear.z = vb.z();
-    o.twist.twist.angular.z = last_wz_ - x(idx::kBias);
+    o.twist.twist.angular.z = gyroRate() - x(idx::kBias);
     for (int r = 0; r < 3; ++r) {
       for (int k = 0; k < 3; ++k) {o.twist.covariance[r * 6 + k] = Cb(r, k);}
     }
     o.twist.covariance[3 * 6 + 3] = o.twist.covariance[4 * 6 + 4] = 1e6;
-    o.twist.covariance[5 * 6 + 5] = gyro_var_ + P(idx::kBias, idx::kBias);
+    o.twist.covariance[5 * 6 + 5] = imu_.timedOut() ? imu_lost_q_yaw_ : gyro_var_ + P(idx::kBias, idx::kBias);
     odom_pub_->publish(o);
 
     std_msgs::msg::Float64MultiArray st;
@@ -421,6 +568,7 @@ private:
     const StampCheck c = ch.check(t);
     switch (c) {
       case StampCheck::kOk:
+        checkTimeouts(t);
         if (first) {
           RCLCPP_INFO(
             get_logger(), "[%s] first message: frame '%s'%s%s, stamp %.3f s", ch.name().c_str(),
@@ -442,6 +590,9 @@ private:
         zaru_sum_ = zaru_sumsq_ = 0.0;
         zaru_vo_sum_.setZero();
         stationary_ = false;
+        newest_stamp_ = t;
+        gps_guard_.reset();
+        vo_guard_.reset();
         return true;
       default:
         RCLCPP_WARN_THROTTLE(
@@ -488,7 +639,8 @@ private:
       get_logger(),
       "[filter] t=%.1f p=(%.2f, %.2f, %.2f) v=(%.2f, %.2f, %.2f) yaw=%.1f deg b=%+.4f rad/s | "
       "sigma xy %.2f m, z %.2f m, yaw %.1f deg, b %.4f | %s | updates (mean NIS / expected): "
-      "GPS %zu (%.2f/3), VO vel %zu (%.2f/3), ZARU %zu (%.2f/1), ZUPT %zu (%.2f/3), VO yaw %zu (%.2f/1)",
+      "GPS %zu (%.2f/3), VO vel %zu (%.2f/3), ZARU %zu (%.2f/1), ZUPT %zu (%.2f/3), VO yaw %zu (%.2f/1) | "
+      "gated so far: GPS %zu rejected, %zu inflated; VO %zu rejected%s%s%s%s",
       ekf_.time(), x(idx::kPx), x(idx::kPy), x(idx::kPz), x(idx::kVx), x(idx::kVy), x(idx::kVz),
       x(idx::kYaw) * 180.0 / M_PI, x(idx::kBias),
       std::sqrt(0.5 * (P(idx::kPx, idx::kPx) + P(idx::kPy, idx::kPy))), std::sqrt(P(idx::kPz, idx::kPz)),
@@ -496,7 +648,10 @@ private:
       stationary_ ? "still" : "moving",
       gps_nis_n_, mean(gps_nis_sum_, gps_nis_n_), vo_vel_nis_n_, mean(vo_vel_nis_sum_, vo_vel_nis_n_),
       zaru_nis_n_, mean(zaru_nis_sum_, zaru_nis_n_), zupt_nis_n_, mean(zupt_nis_sum_, zupt_nis_n_),
-      vo_yaw_nis_n_, mean(vo_yaw_nis_sum_, vo_yaw_nis_n_));
+      vo_yaw_nis_n_, mean(vo_yaw_nis_sum_, vo_yaw_nis_n_),
+      gps_rejected_total_, gps_inflated_total_, vo_rejected_total_,
+      gps_.timedOut() ? " | GPS TIMED OUT" : "", vo_.timedOut() ? " | VO TIMED OUT" : "",
+      imu_.timedOut() ? " | IMU TIMED OUT" : "", gps_guard_.recovering() ? " | GPS RECOVERY" : "");
     gps_nis_sum_ = vo_vel_nis_sum_ = zaru_nis_sum_ = zupt_nis_sum_ = vo_yaw_nis_sum_ = 0.0;
     gps_nis_n_ = vo_vel_nis_n_ = zaru_nis_n_ = zupt_nis_n_ = vo_yaw_nis_n_ = 0;
   }
@@ -543,6 +698,11 @@ private:
   double zupt_nis_sum_{0.0};
   std::size_t zupt_nis_n_{0};
   std::string odom_frame_, base_frame_;
+  // §3
+  double newest_stamp_{0.0};
+  double gps_gate_nis_{16.27}, vo_gate_nis_{16.27}, imu_lost_q_yaw_{1.0};
+  lrs_localization::RejectionGuard gps_guard_, vo_guard_;
+  std::size_t gps_rejected_total_{0}, gps_inflated_total_{0}, vo_rejected_total_{0};
 
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr gps_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr vo_sub_;

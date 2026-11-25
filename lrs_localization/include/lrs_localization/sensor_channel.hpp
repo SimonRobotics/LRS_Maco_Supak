@@ -11,6 +11,11 @@
 //
 // The channel also collects per-window statistics (count, sim-time rate, largest gap) that the
 // node prints periodically, and remembers whether the frame ids matched the sensor contract.
+//
+// Timeout (A2 §3): checkTimeout(now) is called with the newest header stamp of ANY sensor --
+// the simulation time as the sensors see it -- so an outage is measured in stamps, not wall
+// time. It returns true exactly once when the channel goes silent for longer than its timeout;
+// the next accepted sample ends the outage and takeRecoveredGap() then returns its length.
 #pragma once
 
 #include <algorithm>
@@ -47,6 +52,26 @@ public:
   const std::string & expectedChild() const {return child_frame_;}
 
   void setResetJump(double s) {reset_jump_s_ = s;}
+  void setTimeout(double s) {timeout_s_ = s;}
+  double timeout() const {return timeout_s_;}
+
+  // True once, when the newest stamp `now` is more than timeout() after this channel's last
+  // sample. A channel that never sent anything does not time out (it has not started yet).
+  bool checkTimeout(double now)
+  {
+    if (!has_last_ || timed_out_ || !(timeout_s_ > 0.0) || now - last_ <= timeout_s_) {return false;}
+    timed_out_ = true;
+    return true;
+  }
+  bool timedOut() const {return timed_out_;}
+
+  // Length of the outage the last accepted sample ended [s], 0 if it did not end one. Cleared.
+  double takeRecoveredGap()
+  {
+    const double g = recovered_gap_;
+    recovered_gap_ = 0.0;
+    return g;
+  }
 
   // True when frame (and child frame, if this channel has one) match the sensor contract.
   bool frameOk(const std::string & frame, const std::string & child = "") const
@@ -63,6 +88,9 @@ public:
       if (t < last_ - reset_jump_s_) {
         ++n_reset_;
         resetWindow();
+        timed_out_ = false;
+        recovered_gap_ = 0.0;
+        has_last_ = false;  // a new timeline: no gap to the old one
         record(t);
         return StampCheck::kReset;
       }
@@ -100,6 +128,10 @@ private:
     // Gap to the previous accepted sample, also across window boundaries, so an outage
     // that ends right after a report still shows up. After a reset t < last_ -> ignored.
     if (has_last_) {win_max_gap_ = std::max(win_max_gap_, t - last_);}
+    if (timed_out_) {
+      recovered_gap_ = t - last_;
+      timed_out_ = false;
+    }
     if (win_n_ == 0) {win_first_ = t;}
     win_last_ = t;
     ++win_n_;
@@ -116,6 +148,9 @@ private:
 
   std::string name_, frame_, child_frame_;
   double reset_jump_s_{1.0};
+  double timeout_s_{0.0};  // <= 0: never times out
+  bool timed_out_{false};
+  double recovered_gap_{0.0};
 
   bool has_last_{false};
   double last_{0.0};

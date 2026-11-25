@@ -64,3 +64,35 @@ TEST(SensorChannel, WindowRateAndGapUseStamps)
   EXPECT_EQ(w.count, 0u);
   EXPECT_EQ(w.rate_hz, 0.0);
 }
+
+// §3: an outage is measured in header stamps: `now` is the newest stamp of any sensor.
+TEST(SensorChannel, TimeoutAndRecoveryFromStamps)
+{
+  SensorChannel gps("gps", "map");
+  gps.setTimeout(1.0);
+  EXPECT_FALSE(gps.checkTimeout(100.0));  // never sent anything: not started, not timed out
+  for (int k = 0; k <= 10; ++k) {ASSERT_EQ(gps.check(10.0 + 0.2 * k), StampCheck::kOk);}  // last 12.0
+  EXPECT_FALSE(gps.checkTimeout(12.9));
+  EXPECT_FALSE(gps.timedOut());
+  EXPECT_TRUE(gps.checkTimeout(13.01));   // 1.01 s of silence
+  EXPECT_TRUE(gps.timedOut());
+  EXPECT_FALSE(gps.checkTimeout(20.0));   // reported once only
+  EXPECT_DOUBLE_EQ(gps.takeRecoveredGap(), 0.0);
+  ASSERT_EQ(gps.check(27.0), StampCheck::kOk);  // GPS back after a 15 s outage
+  EXPECT_FALSE(gps.timedOut());
+  EXPECT_DOUBLE_EQ(gps.takeRecoveredGap(), 15.0);
+  EXPECT_DOUBLE_EQ(gps.takeRecoveredGap(), 0.0);  // cleared
+  ASSERT_EQ(gps.check(27.2), StampCheck::kOk);
+  EXPECT_DOUBLE_EQ(gps.takeRecoveredGap(), 0.0);  // an ordinary sample ends nothing
+}
+
+TEST(SensorChannel, ResetClearsTimeout)
+{
+  SensorChannel imu("imu", "base_link");
+  imu.setTimeout(0.2);
+  ASSERT_EQ(imu.check(50.0), StampCheck::kOk);
+  EXPECT_TRUE(imu.checkTimeout(51.0));
+  EXPECT_EQ(imu.check(1.0), StampCheck::kReset);
+  EXPECT_FALSE(imu.timedOut());
+  EXPECT_DOUBLE_EQ(imu.takeRecoveredGap(), 0.0);  // no "outage" of -49 s
+}

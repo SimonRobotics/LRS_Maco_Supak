@@ -24,7 +24,7 @@ rm -rf "$OUT"
 "$NODE" --ros-args --params-file "$PARAMS" "$@" >"$LOG" 2>&1 &
 NODE_PID=$!
 ros2 bag record -s mcap -o "$OUT" /lrs_localization/odom /lrs_localization/state \
-  /evaluation/ground_truth /localization/gps /localization/imu \
+  /evaluation/ground_truth /localization/gps /localization/imu /localization/vo \
   >/dev/null 2>&1 &
 REC_PID=$!
 trap 'kill -TERM $NODE_PID $REC_PID 2>/dev/null' EXIT

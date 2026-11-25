@@ -3,6 +3,7 @@
 #include <random>
 
 #include "lrs_localization/ekf.hpp"
+#include "lrs_localization/rejection_guard.hpp"
 
 using namespace lrs_localization;
 
@@ -308,4 +309,181 @@ TEST(Ekf8, TracksNoisyGpsAndIsConsistent)
   EXPECT_LT(std::sqrt(f.P()(kPx, kPx)), 0.6);  // better than one raw GPS fix
   EXPECT_NEAR(nis_sum / nis_n, 3.0, 0.6);
   EXPECT_TRUE(symmetricPositive(f.P()));
+}
+
+// ---------------------------------------------------------------- §3 innovation gate
+
+namespace
+{
+
+constexpr double kGate3 = 16.27;  // chi-square, 3 degrees of freedom, 99.9 %
+const Eigen::Matrix3d kRgps = Eigen::Vector3d(0.36, 0.36, 0.81).asDiagonal();
+
+// The node's process noise and a converged filter: position sigma 0.1 m, velocity 0.1 m/s.
+Ekf8 convergedFilter()
+{
+  StateCov P0 = StateCov::Zero();
+  P0.diagonal() << 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.001, 1e-6;
+  Ekf8 f;
+  ProcessNoise q;
+  q.acc_xy = 0.25;
+  q.acc_z = 0.1;
+  f.setProcessNoise(q);
+  f.initialize(StateVec::Zero(), P0, 0.0);
+  return f;
+}
+
+Gate gate(double nis, bool inflate = false)
+{
+  Gate g;
+  g.nis = nis;
+  g.inflate = inflate;
+  return g;
+}
+
+}  // namespace
+
+TEST(Ekf8, Chi2SurvivalMatchesTables)
+{
+  EXPECT_NEAR(chi2Survival(16.27, 3), 0.001, 2e-5);  // the GPS gate
+  EXPECT_NEAR(chi2Survival(7.815, 3), 0.05, 1e-4);
+  EXPECT_NEAR(chi2Survival(13.82, 2), 0.001, 2e-5);
+  EXPECT_NEAR(chi2Survival(6.635, 1), 0.01, 1e-4);
+  EXPECT_DOUBLE_EQ(chi2Survival(0.0, 3), 1.0);
+}
+
+TEST(Ekf8, GpsOutlierIsRejectedAndNothingChanges)
+{
+  Ekf8 f = convergedFilter();
+  const StateVec x_before = f.x();
+  const StateCov P_before = f.P();
+  // The simulator's outlier is 5-8 m in a random direction; 5 m along z is the hardest case
+  // (largest GPS sigma), and it lies 5 / sqrt(0.01 + 0.81) = 5.5 sigma out.
+  const auto res = f.updatePosition(Eigen::Vector3d(0.0, 0.0, 5.0), kRgps, gate(kGate3));
+  EXPECT_TRUE(res.rejected);
+  EXPECT_FALSE(res.applied);
+  EXPECT_NEAR(res.nis, 25.0 / 0.82, 1e-9);
+  EXPECT_TRUE(f.x() == x_before);
+  EXPECT_TRUE(f.P() == P_before);
+  // An ordinary GPS fix, ~1 sigma off, still passes.
+  const auto ok = f.updatePosition(Eigen::Vector3d(0.6, -0.6, 0.9), kRgps, gate(kGate3));
+  EXPECT_TRUE(ok.applied);
+  EXPECT_FALSE(ok.rejected);
+}
+
+// The gate uses S = H P H^T + R, not a fixed distance: the same 6 m innovation is impossible
+// for a converged filter but perfectly plausible after 15 s of prediction alone, when the filter
+// itself no longer knows where it is (position sigma ~ 20 m).
+TEST(Ekf8, GateIsStatisticalNotAFixedDistance)
+{
+  const Eigen::Vector3d z(6.0, 0.0, 0.0);
+  Ekf8 a = convergedFilter();
+  EXPECT_TRUE(a.updatePosition(z, kRgps, gate(kGate3)).rejected);
+
+  Ekf8 b = convergedFilter();
+  for (int k = 1; k <= 1500; ++k) {b.predictTo(0.01 * k, 0.0);}  // 15 s, no measurements
+  EXPECT_GT(std::sqrt(b.P()(kPx, kPx)), 10.0);
+  const auto res = b.updatePosition(z, kRgps, gate(kGate3));
+  EXPECT_FALSE(res.rejected);
+  EXPECT_TRUE(res.applied);
+  EXPECT_LT(res.nis, 1.0);
+}
+
+// The case the simulator actually produces: GPS off for 15 s, VO body velocity still fused at
+// 10 Hz, and the pending outlier lands on the FIRST fix after GPS returns. VO keeps the velocity
+// -- and so the position growth -- bounded, so the outlier must still be rejected, while the
+// next ordinary fix is accepted.
+TEST(Ekf8, OutlierRightAfterFifteenSecondGpsOutageIsRejected)
+{
+  Ekf8 f = convergedFilter();
+  const Eigen::Matrix3d Rvo = Eigen::Matrix3d::Identity() * 0.1 * 0.1;
+  for (int k = 1; k <= 1500; ++k) {
+    f.predictTo(0.01 * k, 0.0);
+    if (k % 10 == 0) {f.updateBodyVelocity(Eigen::Vector3d::Zero(), Rvo, gate(kGate3));}
+  }
+  ASSERT_TRUE(f.x().allFinite() && f.P().allFinite());
+  for (int i = 0; i < 3; ++i) {EXPECT_LT(std::sqrt(f.P()(kPx + i, kPx + i)), 0.5) << i;}
+  for (const Eigen::Vector3d dir : {Eigen::Vector3d::UnitX(), Eigen::Vector3d::UnitY(), Eigen::Vector3d::UnitZ()}) {
+    Ekf8 g = f;
+    EXPECT_TRUE(g.updatePosition(5.0 * dir, kRgps, gate(kGate3)).rejected) << dir.transpose();
+  }
+  EXPECT_TRUE(f.updatePosition(Eigen::Vector3d(0.5, -0.5, 0.8), kRgps, gate(kGate3)).applied);
+}
+
+// Recovery path: applied with R scaled so that the NIS equals the gate -- a bounded step towards
+// the measurement instead of a jump onto it, and never a rejection.
+TEST(Ekf8, InflatedUpdateHitsTheGateExactly)
+{
+  Ekf8 f = convergedFilter();
+  const Eigen::Vector3d z(3.0, -2.0, 1.0);
+  const Eigen::Matrix3d HPHt = f.P().block<3, 3>(kPx, kPx);
+  const auto res = f.updatePosition(z, kRgps, gate(kGate3, true));
+  ASSERT_TRUE(res.applied);
+  EXPECT_FALSE(res.rejected);
+  EXPECT_GT(res.nis, kGate3);
+  EXPECT_GT(res.r_scale, 1.0);
+  const Eigen::Matrix3d S = HPHt + res.r_scale * kRgps;
+  EXPECT_NEAR(z.dot(S.ldlt().solve(z)), kGate3, 1e-6);
+  const Eigen::Vector3d step = f.x().segment<3>(kPx);
+  EXPECT_GT(step.dot(z), 0.0);            // towards the measurement ...
+  EXPECT_LT(step.norm(), 0.2 * z.norm());  // ... but only a small part of the way
+  EXPECT_TRUE(symmetricPositive(f.P()));
+
+  // A measurement inside the gate is not touched by the inflation.
+  Ekf8 g = convergedFilter();
+  EXPECT_DOUBLE_EQ(g.updatePosition(Eigen::Vector3d(0.3, 0, 0), kRgps, gate(kGate3, true)).r_scale, 1.0);
+}
+
+// IMU timeout: the node predicts with w = b (no turn) and extra yaw noise.
+TEST(Ekf8, PredictionWithoutGyroKeepsYawAndWidensIt)
+{
+  StateVec x0 = StateVec::Zero();
+  x0(kYaw) = 1.0;
+  x0(kBias) = 0.02;
+  Ekf8 a = makeFilter(x0), b = makeFilter(x0);
+  for (int k = 1; k <= 50; ++k) {
+    a.predictTo(10.0 + 0.01 * k, x0(kBias));
+    b.predictTo(10.0 + 0.01 * k, x0(kBias), 0.04);
+  }
+  EXPECT_NEAR(b.x()(kYaw), 1.0, 1e-12);
+  EXPECT_NEAR(b.P()(kYaw, kYaw) - a.P()(kYaw, kYaw), 0.04 * 0.5, 1e-9);
+  EXPECT_TRUE(symmetricPositive(b.P()));
+}
+
+// ---------------------------------------------------------------- §3 rejection guard
+
+
+TEST(RejectionGuard, OneOutlierNeverStartsRecovery)
+{
+  RejectionGuard g(10);
+  for (int k = 0; k < 100; ++k) {  // an outlier every other fix: never 10 in a row
+    EXPECT_EQ(g.onRejected(), RejectionGuard::Event::kNone);
+    g.onApplied(false);
+  }
+  EXPECT_FALSE(g.recovering());
+}
+
+TEST(RejectionGuard, RecoveryAfterNInARowUntilNPassAgain)
+{
+  using E = RejectionGuard::Event;
+  RejectionGuard g(10);
+  for (int k = 1; k < 10; ++k) {EXPECT_EQ(g.onRejected(), E::kNone);}
+  EXPECT_EQ(g.onRejected(), E::kEnterRecovery);  // the 10th
+  EXPECT_TRUE(g.recovering());
+  for (int k = 0; k < 5; ++k) {g.onApplied(true);}  // inflated updates
+  EXPECT_EQ(g.inflatedThisEpisode(), 5u);
+  for (int k = 0; k < 9; ++k) {EXPECT_EQ(g.onApplied(false), E::kNone);}
+  g.onApplied(true);                                // still one far off: count restarts
+  EXPECT_TRUE(g.recovering());
+  for (int k = 1; k < 10; ++k) {EXPECT_EQ(g.onApplied(false), E::kNone);}
+  EXPECT_EQ(g.onApplied(false), E::kLeaveRecovery);
+  EXPECT_FALSE(g.recovering());
+  EXPECT_EQ(g.rejectedInRow(), 0);
+}
+
+TEST(RejectionGuard, ZeroDisablesRecovery)
+{
+  RejectionGuard g(0);
+  for (int k = 0; k < 1000; ++k) {g.onRejected();}
+  EXPECT_FALSE(g.recovering());
 }
